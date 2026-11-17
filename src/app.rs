@@ -161,11 +161,12 @@ fn mods() -> Mods {
     Mods { ctrl: key_down(VK_CONTROL.0), shift: key_down(VK_SHIFT.0) }
 }
 
-/// Display name for a folder: drive label for roots, else the last path component.
-pub fn folder_title(p: &Path) -> String {
+/// Display name for a folder: drive label for roots (from the cached drive list; querying volumes
+/// on every paint can stall on a sleeping drive), else the last path component.
+pub fn folder_title(p: &Path, drives: &[shell::Place]) -> String {
     match p.file_name() {
         Some(n) => n.to_string_lossy().into_owned(),
-        None => shell::drives().into_iter().find(|d| d.path == p).map_or_else(|| p.display().to_string(), |d| d.name),
+        None => drives.iter().find(|d| d.path == p).map_or_else(|| p.display().to_string(), |d| d.name.clone()),
     }
 }
 
@@ -177,7 +178,7 @@ impl App {
         self.history.can_forward()
     }
     pub fn title(&self) -> String {
-        folder_title(self.current_dir())
+        folder_title(self.current_dir(), &self.sidebar.drives)
     }
     pub fn columns_view(&self) -> bool {
         self.view == View::Columns
@@ -377,7 +378,7 @@ impl App {
 
     /// "Where" column text: the result's folder, starting with the searched folder's name.
     pub fn where_label(&self, e: &Entry) -> String {
-        let root = folder_title(&self.search_root);
+        let root = folder_title(&self.search_root, &self.sidebar.drives);
         match e.rel_dir.as_deref().filter(|p| !p.as_os_str().is_empty()) {
             Some(rel) => format!("{root}\\{}", rel.display()),
             None => root,
@@ -1548,5 +1549,20 @@ pub fn run() -> Result<()> {
             DispatchMessageW(&msg);
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::draw::Glyph;
+    use crate::shell::Place;
+
+    #[test]
+    fn folder_title_uses_cached_drive_names() {
+        let drives = [Place { name: "Data (D:)".into(), path: PathBuf::from("D:\\"), glyph: Glyph::Drive }];
+        assert_eq!(folder_title(Path::new("D:\\"), &drives), "Data (D:)");
+        assert_eq!(folder_title(Path::new(r"D:\photos"), &drives), "photos");
+        assert_eq!(folder_title(Path::new("E:\\"), &drives), "E:\\", "unknown roots fall back to the path");
     }
 }
