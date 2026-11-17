@@ -1,5 +1,5 @@
 use crate::draw::Gfx;
-use crate::edit::{self, ID_ADDRESS, ID_SEARCH, WM_EDIT_KEY};
+use crate::edit::{self, ID_ADDRESS, ID_RENAME, ID_SEARCH, WM_EDIT_KEY};
 use crate::search;
 use crate::layout::{self, Layout, compute_layout, nc_hit};
 use crate::listing::{Entry, read_folder};
@@ -26,7 +26,7 @@ use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL, VK_ESCAPE,
-    VK_DOWN, VK_F5, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_DELETE, VK_DOWN, VK_F2, VK_F5, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, Result, w};
@@ -115,6 +115,13 @@ pub struct App {
     edit_font: HFONT,
     edit_brush: HBRUSH,
     pub search_edit: HWND,
+    rename_edit: HWND,
+    /// Row being renamed (list view).
+    renaming: Option<usize>,
+    /// After a reload, select this name and start renaming it (new folder).
+    pending_rename: Option<std::ffi::OsString>,
+    /// After a reload, select this name (Show in Folder).
+    pending_select: Option<std::ffi::OsString>,
     search: Option<search::SearchHandle>,
     search_gen: Generation,
     /// True from the first search until the field is cleared or the user navigates away.
@@ -455,6 +462,7 @@ impl App {
         self.edit_font = edit::make_font(self.scale);
         edit::set_font(self.address, self.edit_font);
         edit::set_font(self.search_edit, self.edit_font);
+        edit::set_font(self.rename_edit, self.edit_font);
         if !self.edit_brush.is_invalid() {
             unsafe {
                 let _ = DeleteObject(self.edit_brush.into());
@@ -475,6 +483,12 @@ impl App {
                 self.hide_address();
             } else if vk == VK_ESCAPE.0 {
                 self.hide_address();
+            }
+        } else if id == ID_RENAME {
+            if vk == VK_RETURN.0 {
+                self.commit_rename();
+            } else if vk == VK_ESCAPE.0 {
+                self.cancel_rename();
             }
         } else if id == ID_SEARCH {
             if vk == VK_RETURN.0 {
@@ -542,6 +556,8 @@ impl App {
                     let root = self.history.current().to_path_buf();
                     self.columns.open_root(root.clone());
                     self.columns.loaded(&root, self.list.entries.clone());
+                } else {
+                    self.apply_pending_selection();
                 }
             }
         }
@@ -572,7 +588,284 @@ impl App {
     }
 
     /// Opens a file with its default app. Folders are handled by navigation.
-    fn open_path(&mut self, _path: &Path) {}
+    fn open_path(&mut self, path: &Path) {
+        if shell::open(Some(self.hwnd), path).is_err() {
+            self.error = Some(format!("Can't open {}.", path.display()));
+            self.invalidate();
+        }
+    }
+
+    /// Full paths of the selected items (list rows, or the focused column's selection).
+    fn selected_paths(&self) -> Vec<PathBuf> {
+        if self.columns_view() {
+            let Some(c) = self.columns.cols.get(self.columns.focus_col) else { return Vec::new() };
+            return c.selected.and_then(|s| c.entries.as_ref()?.get(s)).map(|e| vec![c.path.join(&e.name)]).unwrap_or_default();
+        }
+        self.list.sel.selected().into_iter().filter_map(|i| self.list.entries.get(i)).map(|e| self.entry_path(e)).collect()
+    }
+
+    /// Reloads what is on screen after a file action.
+    fn reload_current(&mut self) {
+        if self.columns_view() {
+            let fc = self.columns.focus_col;
+            self.columns.cols.truncate(fc + 1);
+            if let Some(c) = self.columns.cols.get_mut(fc) {
+                c.selected = None;
+                let p = c.path.clone();
+                self.load_column(p);
+            }
+        } else if !self.searching {
+            self.refresh();
+        }
+    }
+
+    fn report(&mut self, what: &str, r: windows::core::Result<()>) {
+        if let Err(e) = r {
+            self.error = Some(format!("{what} failed: {}", e.message()));
+            self.invalidate();
+        }
+    }
+
+    fn copy_selection(&mut self, cut: bool) {
+        let paths = self.selected_paths();
+        if !paths.is_empty() {
+            let r = shell::clipboard_put(Some(self.hwnd), &paths, cut);
+            self.report(if cut { "Cut" } else { "Copy" }, r);
+        }
+    }
+
+    fn paste_here(&mut self) {
+        let Some((items, cut)) = shell::clipboard_get(Some(self.hwnd)) else { return };
+        let dest = self.current_dir().to_path_buf();
+        let r = shell::paste(Some(self.hwnd), &items, cut, &dest);
+        if r.is_ok() && cut {
+            // A moved file is gone from its source; a second paste must not try again.
+            shell::clipboard_clear(Some(self.hwnd));
+        }
+        self.report("Paste", r);
+        self.reload_current();
+    }
+
+    fn delete_selection(&mut self, permanent: bool) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let r = shell::delete(Some(self.hwnd), &paths, permanent, true);
+        if self.searching {
+            // Keep the results; drop rows whose file is gone.
+            let gone: Vec<bool> = self.list.entries.iter().map(|e| !self.entry_path(e).exists()).collect();
+            let mut it = gone.into_iter();
+            self.list.entries.retain(|_| !it.next().unwrap_or(false));
+            self.list.sel.clear();
+            self.invalidate();
+        }
+        self.report("Delete", r);
+        self.reload_current();
+    }
+
+    fn create_folder(&mut self) {
+        if self.searching {
+            return;
+        }
+        let dir = self.current_dir().to_path_buf();
+        match shell::new_folder(Some(self.hwnd), &dir) {
+            Ok(p) => {
+                if !self.columns_view() {
+                    self.pending_rename = p.file_name().map(|n| n.to_os_string());
+                }
+                self.reload_current();
+            }
+            Err(e) => self.report("New folder", Err(e)),
+        }
+    }
+
+    /// Inline rename over the focused row's name (list view).
+    fn start_rename(&mut self) {
+        if self.columns_view() {
+            return;
+        }
+        let Some(i) = self.list.sel.focus().filter(|&i| i < self.list.entries.len()) else { return };
+        self.list.ensure_visible(i, self.layout.rows.h);
+        let rows = self.layout.rows;
+        let name_w = views::list::columns(rows.w, self.list.show_where)[0].2;
+        let y = rows.y + i as f32 * crate::theme::ROW_H - self.list.scroll_y;
+        let r = crate::layout::Rect::new(rows.x + 10.0 + 24.0 - 2.0, y, name_w - 40.0, crate::theme::ROW_H);
+        let e = &self.list.entries[i];
+        let name = e.name.to_string_lossy().into_owned();
+        // Select the stem so typing keeps the extension, like Explorer.
+        let stem_len = if e.is_dir() { name.encode_utf16().count() } else {
+            Path::new(&name).file_stem().map_or(0, |s| s.to_string_lossy().encode_utf16().count())
+        };
+        self.renaming = Some(i);
+        edit::set_text(self.rename_edit, &name);
+        edit::show_in(self.rename_edit, r, self.scale);
+        edit::focus_select(self.rename_edit, 0, stem_len);
+        self.invalidate();
+    }
+
+    fn cancel_rename(&mut self) {
+        if self.renaming.take().is_some() {
+            edit::hide(self.rename_edit);
+            unsafe {
+                let _ = SetFocus(Some(self.hwnd));
+            }
+            self.invalidate();
+        }
+    }
+
+    fn commit_rename(&mut self) {
+        let Some(i) = self.renaming.take() else { return };
+        let new_name = edit::text(self.rename_edit).trim().to_string();
+        edit::hide(self.rename_edit);
+        unsafe {
+            let _ = SetFocus(Some(self.hwnd));
+        }
+        let Some(e) = self.list.entries.get(i) else { return };
+        if new_name == e.name.to_string_lossy() {
+            self.invalidate();
+            return;
+        }
+        if let Err(m) = shell::validate_name(&new_name) {
+            self.error = Some(m.to_string());
+            self.invalidate();
+            return;
+        }
+        let path = self.entry_path(e);
+        let r = shell::rename(Some(self.hwnd), &path, &new_name);
+        if r.is_ok() {
+            self.list.entries[i].name = new_name.clone().into();
+            self.pending_select = Some(new_name.into());
+        }
+        self.report("Rename", r);
+        self.reload_current();
+        self.invalidate();
+    }
+
+    /// After a reload: select a renamed or "Show in Folder" item, or start renaming a new folder.
+    fn apply_pending_selection(&mut self) {
+        let rename = self.pending_rename.take();
+        let Some(name) = rename.clone().or_else(|| self.pending_select.take()) else { return };
+        if let Some(i) = self.list.entries.iter().position(|e| e.name == name) {
+            self.list.click_row(i, Mods::default());
+            self.list.ensure_visible(i, self.layout.rows.h);
+            if rename.is_some() {
+                self.start_rename();
+            }
+        }
+    }
+
+    fn on_context_menu(&mut self, lp: LPARAM) {
+        let keyboard = lp.0 == -1;
+        let mut screen = POINT { x: lo(lp.0), y: hi(lp.0) };
+        let mut on_item = false;
+        if keyboard {
+            // Shift+F10 / Menu key: anchor at the focused row.
+            let rows = self.layout.rows;
+            let y = self.list.sel.focus().map_or(rows.y, |i| rows.y + (i as f32 + 0.5) * crate::theme::ROW_H - self.list.scroll_y);
+            screen = POINT { x: ((rows.x + 40.0) * self.scale) as i32, y: (y * self.scale) as i32 };
+            unsafe {
+                let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut screen);
+            }
+            on_item = !self.selected_paths().is_empty();
+        } else {
+            let mut pt = screen;
+            unsafe {
+                let _ = ScreenToClient(self.hwnd, &mut pt);
+            }
+            let (x, y) = (pt.x as f32 / self.scale, pt.y as f32 / self.scale);
+            if self.columns_view() {
+                if let Some((col, Some(row))) = views::columns::hit(self, x, y) {
+                    if self.columns.cols[col].selected != Some(row) {
+                        self.column_select(col, row);
+                    }
+                    self.columns.focus_col = col;
+                    on_item = true;
+                }
+            } else if self.layout.rows.contains(x, y) {
+                if let Some(i) = self.list.row_at(y - self.layout.rows.y) {
+                    if !self.list.sel.is_selected(i) {
+                        self.list.click_row(i, Mods::default());
+                    }
+                    on_item = true;
+                }
+            } else if !self.layout.content.contains(x, y) {
+                return;
+            }
+        }
+        self.invalidate();
+        self.context_menu(screen, on_item);
+    }
+
+    /// Right-click menu. `on_item` is false for empty space.
+    fn context_menu(&mut self, screen: POINT, on_item: bool) {
+        const OPEN: usize = 1;
+        const SHOW: usize = 2;
+        const RENAME: usize = 3;
+        const COPY: usize = 4;
+        const CUT: usize = 5;
+        const DELETE: usize = 6;
+        const PASTE: usize = 7;
+        const NEW_FOLDER: usize = 8;
+        const HIDDEN: usize = 9;
+        let can_paste = shell::clipboard_get(Some(self.hwnd)).is_some();
+        let cmd = unsafe {
+            let Ok(m) = CreatePopupMenu() else { return };
+            let add = |id: usize, text: PCWSTR, flags: MENU_ITEM_FLAGS| {
+                let _ = AppendMenuW(m, MF_STRING | flags, id, text);
+            };
+            if on_item {
+                add(OPEN, w!("Open"), MF_ENABLED);
+                if self.searching {
+                    add(SHOW, w!("Show in Folder"), MF_ENABLED);
+                }
+                let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+                add(RENAME, w!("Rename\tF2"), if self.columns_view() { MF_GRAYED } else { MF_ENABLED });
+                add(COPY, w!("Copy\tCtrl+C"), MF_ENABLED);
+                add(CUT, w!("Cut\tCtrl+X"), MF_ENABLED);
+                add(DELETE, w!("Delete\tDel"), MF_ENABLED);
+            } else {
+                add(PASTE, w!("Paste\tCtrl+V"), if can_paste && !self.searching { MF_ENABLED } else { MF_GRAYED });
+                add(NEW_FOLDER, w!("New Folder\tCtrl+Shift+N"), if self.searching { MF_GRAYED } else { MF_ENABLED });
+                let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+                add(HIDDEN, w!("Show Hidden Files"), if self.show_hidden { MF_CHECKED } else { MF_UNCHECKED });
+            }
+            let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, None, self.hwnd, None);
+            let _ = DestroyMenu(m);
+            cmd.0 as usize
+        };
+        match cmd {
+            OPEN => {
+                if self.columns_view() {
+                    if let Some(p) = self.selected_paths().into_iter().next() {
+                        self.open_path(&p);
+                    }
+                } else if let Some(i) = self.list.sel.focus() {
+                    self.open_index(i);
+                }
+            }
+            SHOW => {
+                let target = self.list.sel.focus().and_then(|i| self.list.entries.get(i)).map(|e| (self.entry_path(e), e.name.clone()));
+                if let Some((path, name)) = target
+                    && let Some(parent) = path.parent()
+                {
+                    self.pending_select = Some(name);
+                    self.navigate(parent.to_path_buf(), NavKind::Visit);
+                }
+            }
+            RENAME => self.start_rename(),
+            COPY => self.copy_selection(false),
+            CUT => self.copy_selection(true),
+            DELETE => self.delete_selection(false),
+            PASTE => self.paste_here(),
+            NEW_FOLDER => self.create_folder(),
+            HIDDEN => {
+                self.show_hidden = !self.show_hidden;
+                self.reload_current();
+            }
+            _ => {}
+        }
+    }
 
     /// Full path of a list entry (search results carry their folder relative to the search root).
     pub fn entry_path(&self, e: &Entry) -> PathBuf {
@@ -725,6 +1018,12 @@ impl App {
             v if v == VK_BACK.0 => self.go_back(),
             0x4C if mods().ctrl => self.show_address(), // Ctrl+L
             0x46 if mods().ctrl => self.focus_search(), // Ctrl+F
+            0x43 if mods().ctrl => self.copy_selection(false), // Ctrl+C
+            0x58 if mods().ctrl => self.copy_selection(true),  // Ctrl+X
+            0x56 if mods().ctrl => self.paste_here(),           // Ctrl+V
+            0x4E if mods().ctrl && mods().shift => self.create_folder(), // Ctrl+Shift+N
+            v if v == VK_F2.0 => self.start_rename(),
+            v if v == VK_DELETE.0 => self.delete_selection(mods().shift),
             v if v == VK_ESCAPE.0 && self.searching => {
                 self.clear_search_field();
                 self.end_search(true);
@@ -766,6 +1065,10 @@ impl App {
                 self.on_listing(*m);
                 Some(LRESULT(0))
             }
+            WM_CONTEXTMENU => {
+                self.on_context_menu(lp);
+                Some(LRESULT(0))
+            }
             WM_TIMER if wp.0 == ID_SEARCH_TIMER => {
                 self.run_search();
                 Some(LRESULT(0))
@@ -795,6 +1098,8 @@ impl App {
                 let (id, code) = (wp.0 & 0xFFFF, ((wp.0 >> 16) & 0xFFFF) as u32);
                 if id == ID_ADDRESS && code == EN_KILLFOCUS {
                     self.hide_address();
+                } else if id == ID_RENAME && code == EN_KILLFOCUS {
+                    self.commit_rename();
                 } else if id == ID_SEARCH && code == EN_CHANGE {
                     unsafe { SetTimer(Some(hwnd), ID_SEARCH_TIMER, SEARCH_DEBOUNCE_MS, None) };
                 } else if id == ID_SEARCH && code == EN_KILLFOCUS && edit::text(self.search_edit).trim().is_empty() {
@@ -961,6 +1266,8 @@ impl App {
             }
             WM_MOUSEWHEEL => {
                 let notches = hi(wp.0 as isize) as f32 / WHEEL_DELTA as f32;
+                // The rename box is placed over a row; scrolling would leave it behind.
+                self.commit_rename();
                 if self.columns_view() {
                     self.column_wheel(notches, lp);
                 } else {
@@ -1124,6 +1431,10 @@ pub fn run() -> Result<()> {
             edit_font: HFONT::default(),
             edit_brush: HBRUSH::default(),
             search_edit: edit::create(hwnd, ID_SEARCH)?,
+            rename_edit: edit::create(hwnd, ID_RENAME)?,
+            renaming: None,
+            pending_rename: None,
+            pending_select: None,
             search: None,
             search_gen: Generation::default(),
             searching: false,

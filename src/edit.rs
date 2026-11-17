@@ -13,6 +13,7 @@ use windows::core::{HSTRING, Result, w};
 
 pub const ID_ADDRESS: usize = 101;
 pub const ID_SEARCH: usize = 102;
+pub const ID_RENAME: usize = 103;
 /// Posted to the parent when Enter, Esc, Up or Down is pressed in an edit: wparam = control id, lparam = virtual key.
 pub const WM_EDIT_KEY: u32 = WM_APP + 10;
 
@@ -122,6 +123,14 @@ pub fn focus_select_all(h: HWND) {
     unsafe {
         let _ = SetFocus(Some(h));
         SendMessageW(h, EM_SETSEL, Some(WPARAM(0)), Some(LPARAM(-1)));
+    }
+}
+
+/// Focuses the control and selects characters `start..end` (UTF-16 units).
+pub fn focus_select(h: HWND, start: usize, end: usize) {
+    unsafe {
+        let _ = SetFocus(Some(h));
+        SendMessageW(h, EM_SETSEL, Some(WPARAM(start)), Some(LPARAM(end as isize)));
     }
 }
 
