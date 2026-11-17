@@ -1,7 +1,15 @@
 use crate::draw::Gfx;
 use crate::layout::{self, Layout, compute_layout, nc_hit};
+use crate::listing::{Entry, read_folder};
+use crate::nav::{Generation, History, NavKind, Outcome, apply_listing};
+use crate::shell;
 use crate::theme::Theme;
+use crate::views::list::{ListAction, ListView, Mods};
 use crate::views::{self, toolbar::toolbar_rects};
+use std::collections::HashMap;
+use std::io;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
@@ -10,13 +18,20 @@ use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTS
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
-use windows::Win32::UI::Input::KeyboardAndMouse::{ReleaseCapture, SetCapture, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent};
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL, VK_F5,
+    VK_LEFT, VK_RIGHT, VK_SHIFT, VK_UP,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, Result, w};
 
 const WINDOW_W: f32 = 1100.0;
 const WINDOW_H: f32 = 700.0;
 const RESIZE_BORDER: f32 = 6.0;
+
+pub const WM_LISTING_DONE: u32 = WM_APP + 1;
+pub const WM_SEARCH_BATCH: u32 = WM_APP + 2;
+pub const WM_SEARCH_DONE: u32 = WM_APP + 3;
 
 /// The element under the mouse, for hover drawing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -32,6 +47,29 @@ pub enum Hot {
     Splitter,
 }
 
+/// Result of a background folder read, posted to the UI thread.
+struct ListingMsg {
+    generation: u64,
+    path: PathBuf,
+    kind: NavKind,
+    result: io::Result<Vec<Entry>>,
+}
+
+/// `HWND` is a raw pointer and not `Send`; worker threads carry it as an integer.
+#[derive(Clone, Copy)]
+pub struct SendHwnd(isize);
+
+impl SendHwnd {
+    pub fn post<T>(self, msg: u32, payload: Box<T>) {
+        let raw = Box::into_raw(payload);
+        let hwnd = HWND(self.0 as *mut _);
+        if unsafe { PostMessageW(Some(hwnd), msg, WPARAM(0), LPARAM(raw as isize)) }.is_err() {
+            // Window is gone: reclaim the payload instead of leaking it.
+            drop(unsafe { Box::from_raw(raw) });
+        }
+    }
+}
+
 pub struct App {
     pub hwnd: HWND,
     pub gfx: Gfx,
@@ -45,6 +83,14 @@ pub struct App {
     pub sidebar_w: f32,
     pub layout: Layout,
     pub hot: Hot,
+    pub history: History,
+    pub list: ListView,
+    pub error: Option<String>,
+    pub loading: bool,
+    pub show_hidden: bool,
+    pub type_names: HashMap<String, String>,
+    pub icon_idx: HashMap<String, i32>,
+    listing_gen: Generation,
     pressed_nc: u32,
     dragging_splitter: bool,
     tracking: bool,
@@ -58,15 +104,31 @@ fn hi(v: isize) -> i32 {
     ((v >> 16) & 0xFFFF) as i16 as i32
 }
 
+fn key_down(vk: u16) -> bool {
+    unsafe { GetKeyState(vk as i32) < 0 }
+}
+
+fn mods() -> Mods {
+    Mods { ctrl: key_down(VK_CONTROL.0), shift: key_down(VK_SHIFT.0) }
+}
+
+/// Display name for a folder: drive label for roots, else the last path component.
+pub fn folder_title(p: &Path) -> String {
+    match p.file_name() {
+        Some(n) => n.to_string_lossy().into_owned(),
+        None => shell::drives().into_iter().find(|d| d.path == p).map_or_else(|| p.display().to_string(), |d| d.name),
+    }
+}
+
 impl App {
     pub fn can_back(&self) -> bool {
-        false
+        self.history.can_back()
     }
     pub fn can_forward(&self) -> bool {
-        false
+        self.history.can_forward()
     }
     pub fn title(&self) -> String {
-        "Home".into()
+        folder_title(self.history.current())
     }
     pub fn columns_view(&self) -> bool {
         false
@@ -75,7 +137,13 @@ impl App {
         true
     }
     pub fn search_placeholder(&self) -> String {
-        "Search".into()
+        format!("Search in {}", self.title())
+    }
+    pub fn empty_text(&self) -> &'static str {
+        "This folder is empty"
+    }
+    pub fn current_dir(&self) -> &Path {
+        self.history.current()
     }
     pub fn maximized(&self) -> bool {
         unsafe { IsZoomed(self.hwnd).as_bool() }
@@ -87,8 +155,87 @@ impl App {
         }
     }
 
+    fn send_hwnd(&self) -> SendHwnd {
+        SendHwnd(self.hwnd.0 as isize)
+    }
+
+    /// Reads `path` on a worker thread. History changes only when the read succeeds.
+    pub fn navigate(&mut self, path: PathBuf, kind: NavKind) {
+        let generation = self.listing_gen.next();
+        let (hwnd, show_hidden) = (self.send_hwnd(), self.show_hidden);
+        self.loading = true;
+        std::thread::spawn(move || {
+            let result = read_folder(&path, show_hidden);
+            hwnd.post(WM_LISTING_DONE, Box::new(ListingMsg { generation, path, kind, result }));
+        });
+    }
+
+    fn on_listing(&mut self, m: ListingMsg) {
+        let ok = self.listing_gen.is_current(m.generation);
+        match apply_listing(&mut self.history, ok, m.result.as_ref().err(), m.path, m.kind) {
+            Outcome::Stale => return,
+            Outcome::Failed(msg) => self.error = Some(msg),
+            Outcome::Loaded => {
+                self.error = None;
+                self.list.set_entries(m.result.unwrap_or_default());
+            }
+        }
+        self.loading = false;
+        self.invalidate();
+    }
+
+    fn go_back(&mut self) {
+        if let Some(p) = self.history.back_target() {
+            self.navigate(p.to_path_buf(), NavKind::Back);
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if let Some(p) = self.history.forward_target() {
+            self.navigate(p.to_path_buf(), NavKind::Forward);
+        }
+    }
+
+    fn go_up(&mut self) {
+        if let Some(p) = self.history.parent() {
+            self.navigate(p, NavKind::Visit);
+        }
+    }
+
+    fn refresh(&mut self) {
+        self.navigate(self.current_dir().to_path_buf(), NavKind::Refresh);
+    }
+
+    /// Full path of a list entry (search results carry their folder relative to the current one).
+    pub fn entry_path(&self, e: &Entry) -> PathBuf {
+        let mut p = self.current_dir().to_path_buf();
+        if let Some(rel) = &e.rel_dir {
+            p.push(rel);
+        }
+        p.push(&e.name);
+        p
+    }
+
+    fn open_index(&mut self, i: usize) {
+        let Some(e) = self.list.entries.get(i) else { return };
+        let path = self.entry_path(e);
+        if e.is_dir() {
+            self.navigate(path, NavKind::Visit);
+        }
+    }
+
+    fn handle_list_action(&mut self, a: ListAction) {
+        match a {
+            ListAction::Open(i) => self.open_index(i),
+            ListAction::Redraw => self.invalidate(),
+            ListAction::None => {}
+        }
+    }
+
     fn relayout(&mut self) {
         self.layout = compute_layout(self.w, self.h, self.sidebar_w, 1.0);
+        let max = self.list.max_scroll(self.layout.rows.h);
+        self.list.scroll_y = self.list.scroll_y.min(max);
     }
 
     fn apply_theme_to_frame(&self) {
@@ -156,6 +303,55 @@ impl App {
         }
     }
 
+    fn on_left_down(&mut self, x: f32, y: f32) {
+        let l = self.layout;
+        let r = toolbar_rects(&l);
+        if l.splitter.contains(x, y) {
+            self.dragging_splitter = true;
+            unsafe { SetCapture(self.hwnd) };
+        } else if r.back.contains(x, y) {
+            self.go_back();
+        } else if r.forward.contains(x, y) {
+            self.go_forward();
+        } else if l.header.contains(x, y) {
+            if let Some(c) = self.list.col_at(x - l.header.x, l.header.w) {
+                self.list.click_header(c);
+                self.invalidate();
+            }
+        } else if l.rows.contains(x, y) {
+            match self.list.row_at(y - l.rows.y) {
+                Some(i) => self.list.click_row(i, mods()),
+                None => self.list.sel.clear(),
+            }
+            self.invalidate();
+        }
+    }
+
+    fn on_key(&mut self, vk: u16) -> bool {
+        match vk {
+            v if v == VK_F5.0 => self.refresh(),
+            v if v == VK_BACK.0 => self.go_back(),
+            _ => {
+                let a = self.list.on_key(vk, mods(), self.layout.rows.h);
+                if a == ListAction::None {
+                    return false;
+                }
+                self.handle_list_action(a);
+            }
+        }
+        true
+    }
+
+    fn on_sys_key(&mut self, vk: u16) -> bool {
+        match vk {
+            v if v == VK_LEFT.0 => self.go_back(),
+            v if v == VK_RIGHT.0 => self.go_forward(),
+            v if v == VK_UP.0 => self.go_up(),
+            _ => return false,
+        }
+        true
+    }
+
     fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         let hwnd = self.hwnd;
         match msg {
@@ -164,6 +360,11 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_ERASEBKGND => Some(LRESULT(1)),
+            WM_LISTING_DONE => {
+                let m = unsafe { Box::from_raw(lp.0 as *mut ListingMsg) };
+                self.on_listing(*m);
+                Some(LRESULT(0))
+            }
             WM_SIZE => {
                 let (pw, ph) = (lo(lp.0) as u32, hi(lp.0) as u32);
                 self.w = pw as f32 / self.scale;
@@ -198,6 +399,9 @@ impl App {
             WM_NCMOUSELEAVE | WM_MOUSELEAVE => {
                 self.tracking = false;
                 self.set_hot(Hot::None);
+                if self.list.hover_row.take().is_some() {
+                    self.invalidate();
+                }
                 None
             }
             WM_NCLBUTTONDOWN | WM_NCLBUTTONDBLCLK if matches!(wp.0 as u32, layout::HTMINBUTTON | layout::HTMAXBUTTON | layout::HTCLOSE) => {
@@ -228,7 +432,7 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_MOUSEMOVE => {
-                let (x, _y) = self.client_dip(lp);
+                let (x, y) = self.client_dip(lp);
                 if self.dragging_splitter {
                     self.sidebar_w = x;
                     self.relayout();
@@ -236,15 +440,32 @@ impl App {
                     return Some(LRESULT(0));
                 }
                 self.track_leave(false);
-                let (x, y) = self.client_dip(lp);
                 self.set_hot(self.hot_at(x, y));
+                let rows = self.layout.rows;
+                let hover = if rows.contains(x, y) { self.list.row_at(y - rows.y) } else { None };
+                if hover != self.list.hover_row {
+                    self.list.hover_row = hover;
+                    self.invalidate();
+                }
                 Some(LRESULT(0))
             }
             WM_LBUTTONDOWN => {
+                unsafe {
+                    let _ = SetFocus(Some(hwnd));
+                }
                 let (x, y) = self.client_dip(lp);
-                if self.layout.splitter.contains(x, y) {
-                    self.dragging_splitter = true;
-                    unsafe { SetCapture(hwnd) };
+                self.on_left_down(x, y);
+                Some(LRESULT(0))
+            }
+            WM_LBUTTONDBLCLK => {
+                let (x, y) = self.client_dip(lp);
+                let rows = self.layout.rows;
+                if rows.contains(x, y)
+                    && let Some(i) = self.list.row_at(y - rows.y)
+                {
+                    self.open_index(i);
+                } else {
+                    self.on_left_down(x, y);
                 }
                 Some(LRESULT(0))
             }
@@ -257,6 +478,29 @@ impl App {
                     // Store the clamped value so a later drag starts from what is on screen.
                     self.sidebar_w = self.layout.sidebar.w;
                 }
+                Some(LRESULT(0))
+            }
+            WM_XBUTTONUP => {
+                // Mouse back/forward buttons.
+                match hi(wp.0 as isize) {
+                    1 => self.go_back(),
+                    2 => self.go_forward(),
+                    _ => {}
+                }
+                Some(LRESULT(1))
+            }
+            WM_MOUSEWHEEL => {
+                let notches = hi(wp.0 as isize) as f32 / WHEEL_DELTA as f32;
+                self.list.on_wheel(notches, self.layout.rows.h);
+                self.invalidate();
+                Some(LRESULT(0))
+            }
+            WM_KEYDOWN => self.on_key(wp.0 as u16).then_some(LRESULT(0)),
+            WM_SYSKEYDOWN => self.on_sys_key(wp.0 as u16).then_some(LRESULT(0)),
+            WM_CHAR => {
+                let ch = char::from_u32(wp.0 as u32).filter(|c| !c.is_control())?;
+                let a = self.list.on_char(ch, Instant::now());
+                self.handle_list_action(a);
                 Some(LRESULT(0))
             }
             WM_SETCURSOR => {
@@ -333,6 +577,10 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
     }
 }
 
+fn start_folder() -> PathBuf {
+    shell::favorites().into_iter().next().map(|p| p.path).unwrap_or_else(|| PathBuf::from("C:\\"))
+}
+
 pub fn run() -> Result<()> {
     unsafe {
         let hinst = GetModuleHandleW(None)?;
@@ -369,7 +617,8 @@ pub fn run() -> Result<()> {
         let margins = if mica { MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 } } else { MARGINS { cyTopHeight: 1, ..Default::default() } };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
 
-        let app = Box::new(App {
+        let start = start_folder();
+        let mut app = Box::new(App {
             hwnd,
             gfx: Gfx::new()?,
             theme: Theme::system(),
@@ -380,11 +629,20 @@ pub fn run() -> Result<()> {
             sidebar_w: 200.0,
             layout: Layout::default(),
             hot: Hot::None,
+            history: History::new(start.clone()),
+            list: ListView::default(),
+            error: None,
+            loading: false,
+            show_hidden: false,
+            type_names: HashMap::new(),
+            icon_idx: HashMap::new(),
+            listing_gen: Generation::default(),
             pressed_nc: 0,
             dragging_splitter: false,
             tracking: false,
         });
         app.apply_theme_to_frame();
+        app.navigate(start, NavKind::Refresh);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
         // Re-run WM_NCCALCSIZE, then size the window for this monitor's DPI.
         SetWindowPos(hwnd, None, 0, 0, (WINDOW_W * scale) as i32, (WINDOW_H * scale) as i32, SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED)?;

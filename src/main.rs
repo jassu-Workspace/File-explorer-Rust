@@ -7,6 +7,7 @@ mod draw;
 mod format;
 mod layout;
 mod listing;
+mod nav;
 mod search;
 mod selection;
 mod shell;

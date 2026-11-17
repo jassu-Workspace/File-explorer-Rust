@@ -145,6 +145,7 @@ pub struct Fonts {
     pub body_right: IDWriteTextFormat,
     pub title: IDWriteTextFormat,
     pub small: IDWriteTextFormat,
+    pub small_right: IDWriteTextFormat,
     pub big: IDWriteTextFormat,
 }
 
@@ -190,6 +191,7 @@ impl Gfx {
             body_right: text_format(&dw, 13.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
             title: text_format(&dw, 13.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             small: text_format(&dw, 11.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING)?,
+            small_right: text_format(&dw, 11.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
             big: text_format(&dw, 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?,
         };
         let mut glyphs = HashMap::new();
