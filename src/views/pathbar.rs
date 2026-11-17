@@ -70,7 +70,7 @@ pub fn status_text(app: &App) -> String {
     if let Some(s) = app.status_override() {
         return s;
     }
-    let n = app.list.entries.len();
+    let n = app.item_count();
     let items = if n == 1 { "1 item".to_string() } else { format!("{n} items") };
     match app.free {
         Some(f) => format!("{items}, {} available", format_size(f)),

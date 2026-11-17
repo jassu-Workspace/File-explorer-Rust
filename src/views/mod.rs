@@ -1,3 +1,4 @@
+pub mod columns;
 pub mod list;
 pub mod pathbar;
 pub mod sidebar;
@@ -17,7 +18,12 @@ pub fn paint(app: &mut App) {
     }
     toolbar::paint(app);
     sidebar::paint(app);
-    list::paint(app);
+    if app.columns_view() {
+        columns::paint(app);
+        list::paint_message(app);
+    } else {
+        list::paint(app);
+    }
     {
         let (g, t, l) = (&app.gfx, &app.theme, &app.layout);
         g.line(l.sidebar.w - 0.5, 0.0, l.sidebar.w - 0.5, l.pathbar.y, t.separator);

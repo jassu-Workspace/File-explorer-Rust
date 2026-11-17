@@ -2,7 +2,7 @@ use crate::draw::Gfx;
 use crate::edit::{self, ID_ADDRESS, WM_EDIT_KEY};
 use crate::layout::{self, Layout, compute_layout, nc_hit};
 use crate::listing::{Entry, read_folder};
-use crate::nav::{Generation, History, NavKind, Outcome, apply_listing};
+use crate::nav::{Columns, Generation, History, NavKind, Outcome, apply_listing};
 use crate::shell;
 use crate::theme::Theme;
 use crate::views::list::{ListAction, ListView, Mods};
@@ -25,7 +25,7 @@ use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL, VK_ESCAPE,
-    VK_F5, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_DOWN, VK_F5, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, Result, w};
@@ -37,6 +37,13 @@ const RESIZE_BORDER: f32 = 6.0;
 pub const WM_LISTING_DONE: u32 = WM_APP + 1;
 pub const WM_SEARCH_BATCH: u32 = WM_APP + 2;
 pub const WM_SEARCH_DONE: u32 = WM_APP + 3;
+pub const WM_COLUMN_DONE: u32 = WM_APP + 4;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum View {
+    List,
+    Columns,
+}
 
 /// The element under the mouse, for hover drawing.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -91,6 +98,8 @@ pub struct App {
     pub hot: Hot,
     pub history: History,
     pub list: ListView,
+    pub view: View,
+    pub columns: Columns,
     pub error: Option<String>,
     pub loading: bool,
     pub show_hidden: bool,
@@ -140,10 +149,135 @@ impl App {
         self.history.can_forward()
     }
     pub fn title(&self) -> String {
-        folder_title(self.history.current())
+        folder_title(self.current_dir())
     }
     pub fn columns_view(&self) -> bool {
-        false
+        self.view == View::Columns
+    }
+
+    /// Items shown in the path bar count: the deepest loaded column in column view.
+    pub fn item_count(&self) -> usize {
+        if self.columns_view() {
+            self.columns.cols.iter().rev().find_map(|c| c.entries.as_ref()).map_or(0, Vec::len)
+        } else {
+            self.list.entries.len()
+        }
+    }
+
+    pub fn set_view(&mut self, v: View) {
+        if self.view == v {
+            return;
+        }
+        self.view = v;
+        if v == View::Columns {
+            let root = self.history.current().to_path_buf();
+            self.columns.open_root(root.clone());
+            self.columns.loaded(&root, self.list.entries.clone());
+        } else {
+            self.columns = Columns::default();
+        }
+        self.invalidate();
+    }
+
+    fn load_column(&self, path: PathBuf) {
+        let (hwnd, show_hidden) = (self.send_hwnd(), self.show_hidden);
+        std::thread::spawn(move || {
+            let result = read_folder(&path, show_hidden);
+            hwnd.post(WM_COLUMN_DONE, Box::new((path, result)));
+        });
+    }
+
+    fn on_column(&mut self, path: PathBuf, result: io::Result<Vec<Entry>>) {
+        match result {
+            Ok(mut v) => {
+                crate::listing::sort_entries(&mut v, self.list.sort.0, self.list.sort.1);
+                self.columns.loaded(&path, v);
+            }
+            Err(e) => {
+                self.columns.loaded(&path, Vec::new());
+                self.error = Some(crate::nav::error_message(&path, &e));
+            }
+        }
+        self.invalidate();
+    }
+
+    fn column_select(&mut self, col: usize, row: usize) {
+        self.error = None;
+        if let Some(p) = self.columns.select(col, row) {
+            self.load_column(p);
+        }
+        let viewport = self.layout.content.w;
+        self.columns.scroll_x = views::columns::fit_scroll(views::columns::total_width(self), viewport, self.columns.scroll_x);
+        self.columns.drop_offscreen(viewport, crate::theme::COLUMN_W);
+        let (rows_h, c) = (self.layout.content.h, &mut self.columns.cols[col]);
+        let top = row as f32 * crate::theme::ROW_H;
+        if top < c.scroll_y {
+            c.scroll_y = top;
+        } else if top + crate::theme::ROW_H > c.scroll_y + rows_h {
+            c.scroll_y = top + crate::theme::ROW_H - rows_h;
+        }
+        self.invalidate();
+    }
+
+    /// Wheel scrolls the column under the cursor; Shift+wheel scrolls across columns.
+    fn column_wheel(&mut self, notches: f32, lp: LPARAM) {
+        let step = notches * 3.0 * crate::theme::ROW_H;
+        let content = self.layout.content;
+        if mods().shift {
+            let max = (views::columns::total_width(self) - content.w).max(0.0);
+            self.columns.scroll_x = (self.columns.scroll_x - step).clamp(0.0, max);
+            self.columns.drop_offscreen(content.w, crate::theme::COLUMN_W);
+            // Columns scrolled back into view reload their freed entries.
+            let first = (self.columns.scroll_x / crate::theme::COLUMN_W) as usize;
+            let reload: Vec<PathBuf> =
+                self.columns.cols.iter().skip(first).filter(|c| c.entries.is_none()).map(|c| c.path.clone()).collect();
+            for p in reload {
+                self.load_column(p);
+            }
+            return;
+        }
+        let mut pt = POINT { x: lo(lp.0), y: hi(lp.0) };
+        unsafe {
+            let _ = ScreenToClient(self.hwnd, &mut pt);
+        }
+        let (x, y) = (pt.x as f32 / self.scale, pt.y as f32 / self.scale);
+        if let Some((col, _)) = views::columns::hit(self, x, y) {
+            let c = &mut self.columns.cols[col];
+            let max = (c.entries.as_ref().map_or(0, Vec::len) as f32 * crate::theme::ROW_H - content.h).max(0.0);
+            c.scroll_y = (c.scroll_y - step).clamp(0.0, max);
+        }
+    }
+
+    /// Arrow keys and Enter in column view.
+    fn column_key(&mut self, vk: u16) -> bool {
+        let fc = self.columns.focus_col;
+        let Some(c) = self.columns.cols.get(fc) else { return false };
+        let n = c.entries.as_ref().map_or(0, Vec::len);
+        let cur = c.selected;
+        match vk {
+            v if v == VK_DOWN.0 && n > 0 => self.column_select(fc, cur.map_or(0, |s| (s + 1).min(n - 1))),
+            v if v == VK_UP.0 && n > 0 => self.column_select(fc, cur.map_or(0, |s| s.saturating_sub(1))),
+            v if v == VK_LEFT.0 && fc > 0 => {
+                self.columns.focus_col -= 1;
+                self.columns.cols.truncate(fc + 1);
+                self.invalidate();
+            }
+            v if v == VK_RIGHT.0 => {
+                if self.columns.cols.get(fc + 1).and_then(|c| c.entries.as_ref()).is_some_and(|e| !e.is_empty()) {
+                    self.column_select(fc + 1, 0);
+                }
+            }
+            v if v == VK_RETURN.0 => {
+                if let Some(e) = cur.and_then(|s| c.entries.as_ref()?.get(s)) {
+                    let path = c.path.join(&e.name);
+                    if !e.is_dir() {
+                        self.open_path(&path);
+                    }
+                }
+            }
+            _ => return false,
+        }
+        true
     }
     pub fn search_placeholder_visible(&self) -> bool {
         true
@@ -215,8 +349,9 @@ impl App {
             }
         }
     }
+    /// The folder the user is "in": the deepest column in column view, else the listed folder.
     pub fn current_dir(&self) -> &Path {
-        self.history.current()
+        if self.columns_view() && !self.columns.cols.is_empty() { self.columns.current_dir() } else { self.history.current() }
     }
     pub fn maximized(&self) -> bool {
         unsafe { IsZoomed(self.hwnd).as_bool() }
@@ -254,6 +389,11 @@ impl App {
                 self.error = None;
                 self.free = m.free;
                 self.list.set_entries(m.result.unwrap_or_default());
+                if self.columns_view() {
+                    let root = self.history.current().to_path_buf();
+                    self.columns.open_root(root.clone());
+                    self.columns.loaded(&root, self.list.entries.clone());
+                }
             }
         }
         self.loading = false;
@@ -279,12 +419,15 @@ impl App {
     }
 
     fn refresh(&mut self) {
-        self.navigate(self.current_dir().to_path_buf(), NavKind::Refresh);
+        self.navigate(self.history.current().to_path_buf(), NavKind::Refresh);
     }
 
-    /// Full path of a list entry (search results carry their folder relative to the current one).
+    /// Opens a file with its default app. Folders are handled by navigation.
+    fn open_path(&mut self, _path: &Path) {}
+
+    /// Full path of a list entry (search results carry their folder relative to the listed one).
     pub fn entry_path(&self, e: &Entry) -> PathBuf {
-        let mut p = self.current_dir().to_path_buf();
+        let mut p = self.history.current().to_path_buf();
         if let Some(rel) = &e.rel_dir {
             p.push(rel);
         }
@@ -297,6 +440,8 @@ impl App {
         let path = self.entry_path(e);
         if e.is_dir() {
             self.navigate(path, NavKind::Visit);
+        } else {
+            self.open_path(&path);
         }
     }
 
@@ -395,6 +540,20 @@ impl App {
             }
         } else if let Some(p) = pathbar::hit(self, x, y) {
             self.navigate(p, NavKind::Visit);
+        } else if r.view_list.contains(x, y) {
+            self.set_view(View::List);
+        } else if r.view_cols.contains(x, y) {
+            self.set_view(View::Columns);
+        } else if self.columns_view() {
+            if let Some((col, row)) = views::columns::hit(self, x, y) {
+                match row {
+                    Some(row) => self.column_select(col, row),
+                    None => {
+                        self.columns.focus_col = col;
+                        self.invalidate();
+                    }
+                }
+            }
         } else if l.header.contains(x, y) {
             if let Some(c) = self.list.col_at(x - l.header.x, l.header.w) {
                 self.list.click_header(c);
@@ -414,6 +573,9 @@ impl App {
             v if v == VK_F5.0 => self.refresh(),
             v if v == VK_BACK.0 => self.go_back(),
             0x4C if mods().ctrl => self.show_address(), // Ctrl+L
+            0x31 if mods().ctrl => self.set_view(View::List), // Ctrl+1
+            0x32 if mods().ctrl => self.set_view(View::Columns), // Ctrl+2
+            _ if self.columns_view() => return self.column_key(vk),
             _ => {
                 let a = self.list.on_key(vk, mods(), self.layout.rows.h);
                 if a == ListAction::None {
@@ -446,6 +608,12 @@ impl App {
             WM_LISTING_DONE => {
                 let m = unsafe { Box::from_raw(lp.0 as *mut ListingMsg) };
                 self.on_listing(*m);
+                Some(LRESULT(0))
+            }
+            WM_COLUMN_DONE => {
+                let m = unsafe { Box::from_raw(lp.0 as *mut (PathBuf, io::Result<Vec<Entry>>)) };
+                let (path, result) = *m;
+                self.on_column(path, result);
                 Some(LRESULT(0))
             }
             WM_EDIT_KEY => {
@@ -574,7 +742,17 @@ impl App {
             WM_LBUTTONDBLCLK => {
                 let (x, y) = self.client_dip(lp);
                 let rows = self.layout.rows;
-                if rows.contains(x, y)
+                if self.columns_view() && self.layout.content.contains(x, y) {
+                    // Folders already opened on the first click; a double-click opens files.
+                    if let Some((col, Some(row))) = views::columns::hit(self, x, y) {
+                        let c = &self.columns.cols[col];
+                        if let Some(e) = c.entries.as_ref().and_then(|v| v.get(row)).filter(|e| !e.is_dir()) {
+                            let path = c.path.join(&e.name);
+                            self.open_path(&path);
+                        }
+                    }
+                } else if !self.columns_view()
+                    && rows.contains(x, y)
                     && let Some(i) = self.list.row_at(y - rows.y)
                 {
                     self.open_index(i);
@@ -607,7 +785,11 @@ impl App {
             }
             WM_MOUSEWHEEL => {
                 let notches = hi(wp.0 as isize) as f32 / WHEEL_DELTA as f32;
-                self.list.on_wheel(notches, self.layout.rows.h);
+                if self.columns_view() {
+                    self.column_wheel(notches, lp);
+                } else {
+                    self.list.on_wheel(notches, self.layout.rows.h);
+                }
                 self.invalidate();
                 Some(LRESULT(0))
             }
@@ -753,6 +935,8 @@ pub fn run() -> Result<()> {
             hot: Hot::None,
             history: History::new(start.clone()),
             list: ListView::default(),
+            view: View::List,
+            columns: Columns::default(),
             error: None,
             loading: false,
             show_hidden: false,

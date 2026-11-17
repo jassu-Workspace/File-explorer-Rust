@@ -80,17 +80,80 @@ pub enum Outcome {
     Loaded,
 }
 
+#[derive(Debug)]
+pub struct Column {
+    pub path: PathBuf,
+    /// `None` while loading, or after being freed off-screen.
+    pub entries: Option<Vec<crate::listing::Entry>>,
+    pub selected: Option<usize>,
+    pub scroll_y: f32,
+}
+
+/// Finder-style column view: each selected folder opens a column to the right.
+#[derive(Debug, Default)]
+pub struct Columns {
+    pub cols: Vec<Column>,
+    pub scroll_x: f32,
+    pub focus_col: usize,
+}
+
+impl Columns {
+    pub fn open_root(&mut self, path: PathBuf) {
+        self.cols = vec![Column { path, entries: None, selected: None, scroll_y: 0.0 }];
+        self.scroll_x = 0.0;
+        self.focus_col = 0;
+    }
+
+    /// Selects a row; returns the folder to load when the row is a folder.
+    pub fn select(&mut self, col: usize, row: usize) -> Option<PathBuf> {
+        let c = self.cols.get_mut(col)?;
+        let e = c.entries.as_ref()?.get(row)?;
+        let (is_dir, path) = (e.is_dir(), c.path.join(&e.name));
+        c.selected = Some(row);
+        self.cols.truncate(col + 1);
+        self.focus_col = col;
+        if !is_dir {
+            return None;
+        }
+        self.cols.push(Column { path: path.clone(), entries: None, selected: None, scroll_y: 0.0 });
+        Some(path)
+    }
+
+    pub fn loaded(&mut self, path: &Path, entries: Vec<crate::listing::Entry>) {
+        if let Some(c) = self.cols.iter_mut().find(|c| c.path == path) {
+            c.entries = Some(entries);
+        }
+    }
+
+    pub fn current_dir(&self) -> &Path {
+        self.cols.last().map_or(Path::new(""), |c| c.path.as_path())
+    }
+
+    /// Frees entries of columns scrolled fully out on the left; path and selection stay so they can reload.
+    pub fn drop_offscreen(&mut self, _viewport_w: f32, col_w: f32) {
+        for (i, c) in self.cols.iter_mut().enumerate() {
+            if (i as f32 + 1.0) * col_w <= self.scroll_x {
+                c.entries = None;
+            }
+        }
+    }
+}
+
+pub fn error_message(target: &Path, e: &io::Error) -> String {
+    let why = match e.kind() {
+        io::ErrorKind::PermissionDenied => "Access is denied".to_string(),
+        io::ErrorKind::NotFound => "Folder not found".to_string(),
+        _ => e.to_string(),
+    };
+    format!("Can't open {}: {why}.", target.display())
+}
+
 pub fn apply_listing(h: &mut History, gen_ok: bool, err: Option<&io::Error>, target: PathBuf, kind: NavKind) -> Outcome {
     if !gen_ok {
         return Outcome::Stale;
     }
     if let Some(e) = err {
-        let why = match e.kind() {
-            io::ErrorKind::PermissionDenied => "Access is denied".to_string(),
-            io::ErrorKind::NotFound => "Folder not found".to_string(),
-            _ => e.to_string(),
-        };
-        return Outcome::Failed(format!("Can't open {}: {why}.", target.display()));
+        return Outcome::Failed(error_message(&target, e));
     }
     h.commit(kind, target);
     Outcome::Loaded
@@ -164,5 +227,82 @@ mod tests {
         let err = io::Error::from(io::ErrorKind::PermissionDenied);
         let Outcome::Failed(m) = apply_listing(&mut h, true, Some(&err), p(r"C:\b"), NavKind::Visit) else { panic!() };
         assert!(m.contains(r"C:\b") && m.to_lowercase().contains("access"), "{m}");
+    }
+}
+
+#[cfg(test)]
+mod column_tests {
+    use super::*;
+    use crate::listing::Entry;
+    use std::path::{Path, PathBuf};
+
+    fn e(name: &str, dir: bool) -> Entry {
+        Entry { name: name.into(), size: 0, modified: 0, attrs: if dir { 0x10 } else { 0x20 }, rel_dir: None }
+    }
+
+    fn root() -> Columns {
+        let mut c = Columns::default();
+        c.open_root(PathBuf::from(r"C:\r"));
+        c.loaded(Path::new(r"C:\r"), vec![e("a", true), e("b", true), e("f.txt", false)]);
+        c
+    }
+
+    #[test]
+    fn select_dir_pushes_column() {
+        let mut c = root();
+        assert_eq!(c.select(0, 0), Some(PathBuf::from(r"C:\r\a")));
+        assert_eq!(c.cols.len(), 2);
+        assert!(c.cols[1].entries.is_none());
+        assert_eq!(c.current_dir(), Path::new(r"C:\r\a"));
+    }
+
+    #[test]
+    fn select_truncates_right() {
+        let mut c = root();
+        c.select(0, 0);
+        c.loaded(Path::new(r"C:\r\a"), vec![e("deep", true)]);
+        c.select(1, 0);
+        assert_eq!(c.cols.len(), 3);
+        assert_eq!(c.select(0, 1), Some(PathBuf::from(r"C:\r\b")));
+        assert_eq!(c.cols.len(), 2);
+        assert_eq!(c.cols[1].path, PathBuf::from(r"C:\r\b"));
+    }
+
+    #[test]
+    fn select_file_no_push() {
+        let mut c = root();
+        c.select(0, 0);
+        assert_eq!(c.select(0, 2), None);
+        assert_eq!(c.cols.len(), 1);
+        assert_eq!(c.cols[0].selected, Some(2));
+        assert_eq!(c.current_dir(), Path::new(r"C:\r"));
+    }
+
+    #[test]
+    fn loaded_ignores_unknown() {
+        let mut c = root();
+        c.loaded(Path::new(r"C:\elsewhere"), vec![e("x", false)]);
+        assert_eq!(c.cols.len(), 1);
+        assert_eq!(c.cols[0].entries.as_ref().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn select_out_of_range_is_ignored() {
+        let mut c = root();
+        assert_eq!(c.select(0, 99), None);
+        assert_eq!(c.select(5, 0), None);
+        assert_eq!(c.cols[0].selected, None);
+    }
+
+    #[test]
+    fn drop_offscreen_frees_left_columns() {
+        let mut c = root();
+        c.select(0, 0);
+        c.loaded(Path::new(r"C:\r\a"), vec![e("deep", true)]);
+        c.scroll_x = 300.0;
+        c.drop_offscreen(500.0, 220.0);
+        assert!(c.cols[0].entries.is_none(), "column 0 ends at 220 < scroll_x 300");
+        assert!(c.cols[1].entries.is_some());
+        assert_eq!(c.cols[0].selected, Some(0), "selection survives");
     }
 }
