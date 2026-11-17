@@ -45,7 +45,11 @@ pub fn paint(app: &App) {
     nav_btn(r.back, Glyph::Back, app.can_back(), app.hot == Hot::Back);
     nav_btn(r.forward, Glyph::Forward, app.can_forward(), app.hot == Hot::Forward);
 
-    g.text(&app.title(), r.title, &g.fonts.title, t.text);
+    if app.address_visible() {
+        g.fill_round(r.title, 8.0, t.field_bg);
+    } else {
+        g.text(&app.title(), r.title, &g.fonts.title, t.text);
+    }
 
     // View switcher: a segmented control.
     let seg = Rect::new(r.view_list.x, r.view_list.y, r.view_list.w + r.view_cols.w, r.view_list.h);

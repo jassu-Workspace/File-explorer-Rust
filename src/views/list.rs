@@ -273,7 +273,8 @@ pub fn paint(app: &mut App) {
 
     if let Some(msg) = &app.error {
         let banner = Rect::new(rows.x + 16.0, rows.y + 12.0, rows.w - 32.0, 36.0);
-        app.gfx.fill_round(banner, 8.0, t.close_hover.with_alpha(0.14));
+        // Opaque, so rows underneath do not show through the message.
+        app.gfx.fill_round(banner, 8.0, t.close_hover.with_alpha(0.18).over(t.content_bg));
         app.gfx.text(msg, Rect::new(banner.x + 14.0, banner.y, banner.w - 28.0, banner.h), &app.gfx.fonts.body, t.text);
     } else if app.list.entries.is_empty() && !app.loading {
         let r = Rect::new(rows.x, rows.y + rows.h / 2.0 - 40.0, rows.w, 30.0);

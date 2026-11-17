@@ -22,6 +22,16 @@ impl Color {
     pub fn with_alpha(self, a: f32) -> Color {
         Color { a, ..self }
     }
+    /// This color composited over an opaque background (for GDI, which has no alpha).
+    pub fn over(self, bg: Color) -> Color {
+        let m = |f: f32, b: f32| f * self.a + b * (1.0 - self.a);
+        Color { r: m(self.r, bg.r), g: m(self.g, bg.g), b: m(self.b, bg.b), a: 1.0 }
+    }
+    /// GDI COLORREF (0x00BBGGRR).
+    pub fn to_colorref(self) -> u32 {
+        let c = |v: f32| (v.clamp(0.0, 1.0) * 255.0).round() as u32;
+        c(self.r) | (c(self.g) << 8) | (c(self.b) << 16)
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -124,5 +134,17 @@ mod tests {
             assert!(contrast(t.text_dim, t.content_bg) >= 4.5, "dark={}", t.dark);
             assert!(contrast(t.text, t.window_bg) >= 7.0, "dark={}", t.dark);
         }
+    }
+}
+
+#[cfg(test)]
+mod blend_tests {
+    use super::*;
+
+    #[test]
+    fn over_blends() {
+        let c = Color::rgb(0x000000).with_alpha(0.5).over(Color::rgb(0xFFFFFF));
+        assert!((c.r - 0.5).abs() < 1e-6 && c.a == 1.0);
+        assert_eq!(Color::rgb(0x112233).to_colorref(), 0x332211);
     }
 }

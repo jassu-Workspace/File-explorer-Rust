@@ -1,11 +1,13 @@
 use crate::draw::Gfx;
+use crate::edit::{self, ID_ADDRESS, WM_EDIT_KEY};
 use crate::layout::{self, Layout, compute_layout, nc_hit};
 use crate::listing::{Entry, read_folder};
 use crate::nav::{Generation, History, NavKind, Outcome, apply_listing};
 use crate::shell;
 use crate::theme::Theme;
 use crate::views::list::{ListAction, ListView, Mods};
-use crate::views::{self, toolbar::toolbar_rects};
+use crate::views::sidebar::Sidebar;
+use crate::views::{self, pathbar, toolbar::toolbar_rects};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -14,13 +16,16 @@ use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
 };
-use windows::Win32::Graphics::Gdi::{BeginPaint, EndPaint, InvalidateRect, PAINTSTRUCT, ScreenToClient};
+use windows::Win32::Foundation::COLORREF;
+use windows::Win32::Graphics::Gdi::{
+    BeginPaint, CreateSolidBrush, DeleteObject, EndPaint, HBRUSH, HDC, HFONT, InvalidateRect, PAINTSTRUCT, ScreenToClient, SetBkColor, SetTextColor,
+};
 use windows::Win32::System::LibraryLoader::GetModuleHandleW;
 use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
-    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL, VK_F5,
-    VK_LEFT, VK_RIGHT, VK_SHIFT, VK_UP,
+    GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL, VK_ESCAPE,
+    VK_F5, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, Result, w};
@@ -53,6 +58,7 @@ struct ListingMsg {
     path: PathBuf,
     kind: NavKind,
     result: io::Result<Vec<Entry>>,
+    free: Option<u64>,
 }
 
 /// `HWND` is a raw pointer and not `Send`; worker threads carry it as an integer.
@@ -90,6 +96,12 @@ pub struct App {
     pub show_hidden: bool,
     pub type_names: HashMap<String, String>,
     pub icon_idx: HashMap<String, i32>,
+    pub sidebar: Sidebar,
+    /// Free bytes on the current folder's drive.
+    pub free: Option<u64>,
+    pub address: HWND,
+    edit_font: HFONT,
+    edit_brush: HBRUSH,
     listing_gen: Generation,
     pressed_nc: u32,
     dragging_splitter: bool,
@@ -142,6 +154,67 @@ impl App {
     pub fn empty_text(&self) -> &'static str {
         "This folder is empty"
     }
+    /// Path-bar status that replaces the item count (search progress).
+    pub fn status_override(&self) -> Option<String> {
+        None
+    }
+    pub fn address_visible(&self) -> bool {
+        edit::visible(self.address)
+    }
+
+    fn show_address(&mut self) {
+        let r = toolbar_rects(&self.layout).title;
+        edit::set_text(self.address, &self.current_dir().display().to_string());
+        edit::show_in(self.address, crate::layout::Rect::new(r.x + 8.0, r.y, r.w - 16.0, r.h), self.scale);
+        edit::focus_select_all(self.address);
+        self.invalidate();
+    }
+
+    fn hide_address(&mut self) {
+        if self.address_visible() {
+            edit::hide(self.address);
+            unsafe {
+                let _ = SetFocus(Some(self.hwnd));
+            }
+            self.invalidate();
+        }
+    }
+
+    fn reposition_edits(&self) {
+        if self.address_visible() {
+            let r = toolbar_rects(&self.layout).title;
+            edit::show_in(self.address, crate::layout::Rect::new(r.x + 8.0, r.y, r.w - 16.0, r.h), self.scale);
+        }
+    }
+
+    /// GDI font and brush for the EDIT children; rebuilt on DPI or theme change.
+    fn rebuild_edit_style(&mut self) {
+        edit::delete_font(self.edit_font);
+        self.edit_font = edit::make_font(self.scale);
+        edit::set_font(self.address, self.edit_font);
+        if !self.edit_brush.is_invalid() {
+            unsafe {
+                let _ = DeleteObject(self.edit_brush.into());
+            }
+        }
+        let bg = self.theme.field_bg.over(self.theme.window_bg);
+        self.edit_brush = unsafe { CreateSolidBrush(COLORREF(bg.to_colorref())) };
+    }
+
+    fn on_edit_key(&mut self, id: usize, vk: u16) {
+        if id == ID_ADDRESS {
+            if vk == VK_RETURN.0 {
+                let text = edit::text(self.address);
+                let t = text.trim().trim_matches('"');
+                if !t.is_empty() {
+                    self.navigate(PathBuf::from(t), NavKind::Visit);
+                }
+                self.hide_address();
+            } else if vk == VK_ESCAPE.0 {
+                self.hide_address();
+            }
+        }
+    }
     pub fn current_dir(&self) -> &Path {
         self.history.current()
     }
@@ -166,7 +239,9 @@ impl App {
         self.loading = true;
         std::thread::spawn(move || {
             let result = read_folder(&path, show_hidden);
-            hwnd.post(WM_LISTING_DONE, Box::new(ListingMsg { generation, path, kind, result }));
+            // Off the UI thread: GetDiskFreeSpaceEx can stall on network shares.
+            let free = shell::free_space(&path);
+            hwnd.post(WM_LISTING_DONE, Box::new(ListingMsg { generation, path, kind, result, free }));
         });
     }
 
@@ -177,6 +252,7 @@ impl App {
             Outcome::Failed(msg) => self.error = Some(msg),
             Outcome::Loaded => {
                 self.error = None;
+                self.free = m.free;
                 self.list.set_entries(m.result.unwrap_or_default());
             }
         }
@@ -313,6 +389,12 @@ impl App {
             self.go_back();
         } else if r.forward.contains(x, y) {
             self.go_forward();
+        } else if let Some(i) = self.sidebar.hit(x, y, l.sidebar) {
+            if let Some(p) = self.sidebar.place(i) {
+                self.navigate(p.path.clone(), NavKind::Visit);
+            }
+        } else if let Some(p) = pathbar::hit(self, x, y) {
+            self.navigate(p, NavKind::Visit);
         } else if l.header.contains(x, y) {
             if let Some(c) = self.list.col_at(x - l.header.x, l.header.w) {
                 self.list.click_header(c);
@@ -331,6 +413,7 @@ impl App {
         match vk {
             v if v == VK_F5.0 => self.refresh(),
             v if v == VK_BACK.0 => self.go_back(),
+            0x4C if mods().ctrl => self.show_address(), // Ctrl+L
             _ => {
                 let a = self.list.on_key(vk, mods(), self.layout.rows.h);
                 if a == ListAction::None {
@@ -365,12 +448,41 @@ impl App {
                 self.on_listing(*m);
                 Some(LRESULT(0))
             }
+            WM_EDIT_KEY => {
+                self.on_edit_key(wp.0, lp.0 as u16);
+                Some(LRESULT(0))
+            }
+            WM_COMMAND => {
+                let (id, code) = (wp.0 & 0xFFFF, ((wp.0 >> 16) & 0xFFFF) as u32);
+                if id == ID_ADDRESS && code == EN_KILLFOCUS {
+                    self.hide_address();
+                }
+                Some(LRESULT(0))
+            }
+            WM_CTLCOLOREDIT => {
+                let hdc = HDC(wp.0 as *mut _);
+                let bg = self.theme.field_bg.over(self.theme.window_bg);
+                unsafe {
+                    SetTextColor(hdc, COLORREF(self.theme.text.to_colorref()));
+                    SetBkColor(hdc, COLORREF(bg.to_colorref()));
+                }
+                Some(LRESULT(self.edit_brush.0 as isize))
+            }
+            WM_DEVICECHANGE => {
+                // DBT_DEVICEARRIVAL / DBT_DEVICEREMOVECOMPLETE: a drive may have come or gone.
+                if matches!(wp.0, 0x8000 | 0x8004) {
+                    self.sidebar.drives = shell::drives();
+                    self.invalidate();
+                }
+                None
+            }
             WM_SIZE => {
                 let (pw, ph) = (lo(lp.0) as u32, hi(lp.0) as u32);
                 self.w = pw as f32 / self.scale;
                 self.h = ph as f32 / self.scale;
                 self.gfx.resize(pw, ph);
                 self.relayout();
+                self.reposition_edits();
                 self.invalidate();
                 Some(LRESULT(0))
             }
@@ -443,8 +555,10 @@ impl App {
                 self.set_hot(self.hot_at(x, y));
                 let rows = self.layout.rows;
                 let hover = if rows.contains(x, y) { self.list.row_at(y - rows.y) } else { None };
-                if hover != self.list.hover_row {
+                let side = self.sidebar.hit(x, y, self.layout.sidebar);
+                if hover != self.list.hover_row || side != self.sidebar.hover {
                     self.list.hover_row = hover;
+                    self.sidebar.hover = side;
                     self.invalidate();
                 }
                 Some(LRESULT(0))
@@ -464,6 +578,8 @@ impl App {
                     && let Some(i) = self.list.row_at(y - rows.y)
                 {
                     self.open_index(i);
+                } else if toolbar_rects(&self.layout).title.contains(x, y) {
+                    self.show_address();
                 } else {
                     self.on_left_down(x, y);
                 }
@@ -522,6 +638,7 @@ impl App {
             WM_DPICHANGED => {
                 self.scale = (wp.0 & 0xFFFF) as f32 / 96.0;
                 self.gfx.set_dpi(96.0 * self.scale);
+                self.rebuild_edit_style();
                 let r = unsafe { &*(lp.0 as *const RECT) };
                 unsafe {
                     let _ = SetWindowPos(hwnd, None, r.left, r.top, r.right - r.left, r.bottom - r.top, SWP_NOZORDER | SWP_NOACTIVATE);
@@ -533,12 +650,17 @@ impl App {
                 if is_color {
                     self.theme = Theme::system();
                     self.apply_theme_to_frame();
+                    self.rebuild_edit_style();
                     self.invalidate();
                 }
                 None
             }
             WM_DESTROY => {
-                unsafe { PostQuitMessage(0) };
+                edit::delete_font(self.edit_font);
+                unsafe {
+                    let _ = DeleteObject(self.edit_brush.into());
+                    PostQuitMessage(0);
+                }
                 Some(LRESULT(0))
             }
             _ => None,
@@ -636,12 +758,18 @@ pub fn run() -> Result<()> {
             show_hidden: false,
             type_names: HashMap::new(),
             icon_idx: HashMap::new(),
+            sidebar: Sidebar::load(),
+            free: None,
+            address: edit::create(hwnd, ID_ADDRESS)?,
+            edit_font: HFONT::default(),
+            edit_brush: HBRUSH::default(),
             listing_gen: Generation::default(),
             pressed_nc: 0,
             dragging_splitter: false,
             tracking: false,
         });
         app.apply_theme_to_frame();
+        app.rebuild_edit_style();
         app.navigate(start, NavKind::Refresh);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
         // Re-run WM_NCCALCSIZE, then size the window for this monitor's DPI.

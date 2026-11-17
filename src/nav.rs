@@ -87,7 +87,7 @@ pub fn apply_listing(h: &mut History, gen_ok: bool, err: Option<&io::Error>, tar
     if let Some(e) = err {
         let why = match e.kind() {
             io::ErrorKind::PermissionDenied => "Access is denied".to_string(),
-            io::ErrorKind::NotFound => "The folder no longer exists".to_string(),
+            io::ErrorKind::NotFound => "Folder not found".to_string(),
             _ => e.to_string(),
         };
         return Outcome::Failed(format!("Can't open {}: {why}.", target.display()));

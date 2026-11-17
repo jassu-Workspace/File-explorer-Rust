@@ -1,4 +1,6 @@
 pub mod list;
+pub mod pathbar;
+pub mod sidebar;
 pub mod toolbar;
 
 use crate::app::App;
@@ -14,9 +16,13 @@ pub fn paint(app: &mut App) {
         g.fill_rect(l.content, t.content_bg);
     }
     toolbar::paint(app);
+    sidebar::paint(app);
     list::paint(app);
-    let (g, t, l) = (&app.gfx, &app.theme, &app.layout);
-    g.line(l.sidebar.w - 0.5, 0.0, l.sidebar.w - 0.5, l.pathbar.y, t.separator);
-    g.fill_rect(l.pathbar, t.window_bg);
-    g.line(0.0, l.pathbar.y + 0.5, l.pathbar.w, l.pathbar.y + 0.5, t.separator);
+    {
+        let (g, t, l) = (&app.gfx, &app.theme, &app.layout);
+        g.line(l.sidebar.w - 0.5, 0.0, l.sidebar.w - 0.5, l.pathbar.y, t.separator);
+        g.fill_rect(l.pathbar, t.window_bg);
+        g.line(0.0, l.pathbar.y + 0.5, l.pathbar.w, l.pathbar.y + 0.5, t.separator);
+    }
+    pathbar::paint(app);
 }

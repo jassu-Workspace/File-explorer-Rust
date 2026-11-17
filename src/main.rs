@@ -4,6 +4,7 @@
 
 mod app;
 mod draw;
+mod edit;
 mod format;
 mod layout;
 mod listing;
