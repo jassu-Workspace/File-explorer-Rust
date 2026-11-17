@@ -1,10 +1,21 @@
+#![windows_subsystem = "windows"]
 // shortcut: allow dead_code while modules land ahead of their UI wiring, remove in Task 11.
 #![allow(dead_code)]
 
-mod listing;
-mod search;
+mod app;
+mod draw;
 mod format;
 mod layout;
+mod listing;
+mod search;
 mod selection;
+mod theme;
+mod views;
 
-fn main() {}
+use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+
+fn main() -> windows::core::Result<()> {
+    // IFileOperation and the shell need an STA on the UI thread.
+    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+    app::run()
+}
