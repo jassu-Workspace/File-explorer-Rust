@@ -9,6 +9,13 @@ use windows::Win32::Graphics::Direct2D::Common::{
 use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
+use windows::Win32::Graphics::Imaging::{
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapDitherTypeNone, WICBitmapPaletteTypeMedianCut,
+};
+use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
+use windows::Win32::UI::Controls::{IImageList, ILD_NORMAL};
+use windows::Win32::UI::Shell::{SHGetImageList, SHIL_LARGE, SHIL_SMALL};
+use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
 use windows::core::{Result, w};
 use windows_numerics::{Matrix3x2, Vector2};
 
@@ -162,6 +169,7 @@ pub struct Gfx {
     rt: Option<ID2D1HwndRenderTarget>,
     brush: Option<ID2D1SolidColorBrush>,
     icons: HashMap<i32, Option<ID2D1Bitmap>>,
+    wic: Option<IWICImagingFactory>,
     dpi: f32,
 }
 
@@ -188,7 +196,7 @@ impl Gfx {
         for g in ALL_GLYPHS {
             glyphs.insert(g, build_geometry(&factory, glyph_path(g))?);
         }
-        Ok(Gfx { factory, dw, fonts, glyphs, rt: None, brush: None, icons: HashMap::new(), dpi: 96.0 })
+        Ok(Gfx { factory, dw, fonts, glyphs, rt: None, brush: None, icons: HashMap::new(), wic: None, dpi: 96.0 })
     }
 
     /// Creates the render target on first use or after device loss.
@@ -333,8 +341,33 @@ impl Gfx {
         self.rt.as_ref()
     }
 
-    pub fn icon_cache(&mut self) -> &mut HashMap<i32, Option<ID2D1Bitmap>> {
-        &mut self.icons
+    /// System image-list icon as a D2D bitmap, converted once per index and cached until device loss.
+    /// `large` picks the 32 px list for high-DPI screens.
+    pub fn icon(&mut self, index: i32, large: bool) -> Option<ID2D1Bitmap> {
+        let key = if large { index | (1 << 30) } else { index };
+        if let Some(b) = self.icons.get(&key) {
+            return b.clone();
+        }
+        let b = self.load_icon(index, large).ok();
+        self.icons.insert(key, b.clone());
+        b
+    }
+
+    fn load_icon(&mut self, index: i32, large: bool) -> Result<ID2D1Bitmap> {
+        let rt = self.rt.as_ref().ok_or_else(windows::core::Error::empty)?;
+        if self.wic.is_none() {
+            self.wic = Some(unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? });
+        }
+        let wic = self.wic.as_ref().unwrap();
+        unsafe {
+            let list: IImageList = SHGetImageList((if large { SHIL_LARGE } else { SHIL_SMALL }) as i32)?;
+            let hicon = list.GetIcon(index, ILD_NORMAL.0)?;
+            let src = wic.CreateBitmapFromHICON(hicon);
+            let _ = DestroyIcon(hicon);
+            let conv = wic.CreateFormatConverter()?;
+            conv.Initialize(&src?, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)?;
+            rt.CreateBitmapFromWicBitmap(&conv, None)
+        }
     }
 
     pub fn bitmap(&self, bmp: &ID2D1Bitmap, r: Rect) {

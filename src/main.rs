@@ -9,6 +9,7 @@ mod layout;
 mod listing;
 mod search;
 mod selection;
+mod shell;
 mod theme;
 mod views;
 
