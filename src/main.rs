@@ -2,5 +2,6 @@
 #![allow(dead_code)]
 
 mod listing;
+mod search;
 
 fn main() {}
