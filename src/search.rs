@@ -12,6 +12,24 @@ pub fn name_matches(name: &OsStr, query_lower: &str) -> bool {
     name.to_string_lossy().to_lowercase().contains(query_lower)
 }
 
+/// Path-bar text for a search in progress or finished.
+pub fn status_text(running: bool, matched: usize, skipped: usize) -> String {
+    if running {
+        return format!("Searching… {matched}");
+    }
+    let mut s = match matched {
+        0 => "No results".to_string(),
+        1 => "1 result".to_string(),
+        n => format!("{n} results"),
+    };
+    match skipped {
+        0 => {}
+        1 => s.push_str(", 1 folder skipped"),
+        k => s.push_str(&format!(", {k} folders skipped")),
+    }
+    s
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SearchStats {
     pub matched: usize,
@@ -327,5 +345,18 @@ mod tests {
         let (v, _) = run(&root, "f99", true);
         assert_eq!(v.len(), 2000);
         assert!(t.elapsed() < Duration::from_secs(1), "took {:?}", t.elapsed());
+    }
+}
+
+#[cfg(test)]
+mod status_tests {
+    use super::*;
+
+    #[test]
+    fn display_status_strings() {
+        assert_eq!(status_text(true, 412, 0), "Searching… 412");
+        assert_eq!(status_text(false, 3, 0), "3 results");
+        assert_eq!(status_text(false, 1, 2), "1 result, 2 folders skipped");
+        assert_eq!(status_text(false, 0, 1), "No results, 1 folder skipped");
     }
 }

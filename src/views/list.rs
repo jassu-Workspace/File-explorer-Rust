@@ -262,8 +262,7 @@ pub fn paint(app: &mut App) {
                     app.gfx.text(&s, cell, &app.gfx.fonts.body, dim);
                 }
                 Col::Where => {
-                    let s = e.rel_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
-                    let s = if s.is_empty() { ".".to_string() } else { s };
+                    let s = app.where_label(e);
                     app.gfx.text(&s, cell, &app.gfx.fonts.body, dim);
                 }
             }

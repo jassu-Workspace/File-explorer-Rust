@@ -1,5 +1,6 @@
 use crate::draw::Gfx;
-use crate::edit::{self, ID_ADDRESS, WM_EDIT_KEY};
+use crate::edit::{self, ID_ADDRESS, ID_SEARCH, WM_EDIT_KEY};
+use crate::search;
 use crate::layout::{self, Layout, compute_layout, nc_hit};
 use crate::listing::{Entry, read_folder};
 use crate::nav::{Columns, Generation, History, NavKind, Outcome, apply_listing};
@@ -38,6 +39,8 @@ pub const WM_LISTING_DONE: u32 = WM_APP + 1;
 pub const WM_SEARCH_BATCH: u32 = WM_APP + 2;
 pub const WM_SEARCH_DONE: u32 = WM_APP + 3;
 pub const WM_COLUMN_DONE: u32 = WM_APP + 4;
+const ID_SEARCH_TIMER: usize = 1;
+const SEARCH_DEBOUNCE_MS: u32 = 150;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -111,6 +114,15 @@ pub struct App {
     pub address: HWND,
     edit_font: HFONT,
     edit_brush: HBRUSH,
+    pub search_edit: HWND,
+    search: Option<search::SearchHandle>,
+    search_gen: Generation,
+    /// True from the first search until the field is cleared or the user navigates away.
+    pub searching: bool,
+    search_running: bool,
+    search_skipped: usize,
+    search_root: PathBuf,
+    pre_search_view: View,
     listing_gen: Generation,
     pressed_nc: u32,
     dragging_splitter: bool,
@@ -166,6 +178,14 @@ impl App {
 
     pub fn set_view(&mut self, v: View) {
         if self.view == v {
+            return;
+        }
+        if self.searching {
+            // The list holds search results, not the folder: leave search and reload in the new view.
+            self.clear_search_field();
+            self.end_search(false);
+            self.view = v;
+            self.refresh();
             return;
         }
         self.view = v;
@@ -280,7 +300,112 @@ impl App {
         true
     }
     pub fn search_placeholder_visible(&self) -> bool {
-        true
+        !edit::visible(self.search_edit)
+    }
+
+    /// "Where" column text: the result's folder, starting with the searched folder's name.
+    pub fn where_label(&self, e: &Entry) -> String {
+        let root = folder_title(&self.search_root);
+        match e.rel_dir.as_deref().filter(|p| !p.as_os_str().is_empty()) {
+            Some(rel) => format!("{root}\\{}", rel.display()),
+            None => root,
+        }
+    }
+
+    fn search_field_rect(&self) -> crate::layout::Rect {
+        let r = toolbar_rects(&self.layout).search;
+        crate::layout::Rect::new(r.x + 28.0, r.y, r.w - 36.0, r.h)
+    }
+
+    fn focus_search(&mut self) {
+        edit::show_in(self.search_edit, self.search_field_rect(), self.scale);
+        edit::focus_select_all(self.search_edit);
+        self.invalidate();
+    }
+
+    /// Starts (or restarts) a search for the search field's text in the current folder tree.
+    fn run_search(&mut self) {
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), ID_SEARCH_TIMER);
+        }
+        let query = edit::text(self.search_edit).trim().to_string();
+        if query.is_empty() {
+            self.end_search(true);
+            return;
+        }
+        if self.search.is_none() && !self.searching {
+            // First keystroke of a new search: remember where we came from.
+            self.search_root = self.current_dir().to_path_buf();
+            self.pre_search_view = self.view;
+        }
+        self.search = None; // dropping the handle cancels the previous walk
+        self.searching = true;
+        self.search_running = true;
+        self.search_skipped = 0;
+        self.view = View::List;
+        self.columns = Columns::default();
+        self.list.show_where = true;
+        self.list.set_entries(Vec::new());
+        self.error = None;
+        let generation = self.search_gen.next();
+        let (h1, h2) = (self.send_hwnd(), self.send_hwnd());
+        self.search = Some(search::start_search(
+            self.search_root.clone(),
+            &query,
+            self.show_hidden,
+            move |batch| h1.post(WM_SEARCH_BATCH, Box::new((generation, batch))),
+            move |stats| h2.post(WM_SEARCH_DONE, Box::new((generation, stats))),
+        ));
+        self.invalidate();
+    }
+
+    fn on_search_batch(&mut self, generation: u64, mut batch: Vec<Entry>) {
+        if !self.searching || !self.search_gen.is_current(generation) {
+            return;
+        }
+        self.list.entries.append(&mut batch);
+        // Keep results sorted while the list is small; past that, sort once when the walk ends.
+        if self.list.entries.len() < 50_000 {
+            self.list.resort();
+        }
+        self.invalidate();
+    }
+
+    fn on_search_done(&mut self, generation: u64, stats: search::SearchStats) {
+        if !self.searching || !self.search_gen.is_current(generation) {
+            return;
+        }
+        self.search_running = false;
+        self.search_skipped = stats.skipped_denied;
+        if self.list.entries.len() >= 50_000 {
+            self.list.resort();
+        }
+        self.invalidate();
+    }
+
+    /// Leaves search mode. `reload` restores the folder listing and the view used before searching.
+    fn end_search(&mut self, reload: bool) {
+        let was = self.searching;
+        self.search = None;
+        self.searching = false;
+        self.search_running = false;
+        self.list.show_where = false;
+        if !was {
+            return;
+        }
+        if reload {
+            self.view = self.pre_search_view;
+            self.refresh();
+        }
+    }
+
+    fn clear_search_field(&mut self) {
+        edit::set_text(self.search_edit, "");
+        edit::hide(self.search_edit);
+        unsafe {
+            let _ = KillTimer(Some(self.hwnd), ID_SEARCH_TIMER);
+            let _ = SetFocus(Some(self.hwnd));
+        }
     }
     pub fn search_placeholder(&self) -> String {
         format!("Search in {}", self.title())
@@ -290,7 +415,7 @@ impl App {
     }
     /// Path-bar status that replaces the item count (search progress).
     pub fn status_override(&self) -> Option<String> {
-        None
+        self.searching.then(|| search::status_text(self.search_running, self.list.entries.len(), self.search_skipped))
     }
     pub fn address_visible(&self) -> bool {
         edit::visible(self.address)
@@ -319,6 +444,9 @@ impl App {
             let r = toolbar_rects(&self.layout).title;
             edit::show_in(self.address, crate::layout::Rect::new(r.x + 8.0, r.y, r.w - 16.0, r.h), self.scale);
         }
+        if edit::visible(self.search_edit) {
+            edit::show_in(self.search_edit, self.search_field_rect(), self.scale);
+        }
     }
 
     /// GDI font and brush for the EDIT children; rebuilt on DPI or theme change.
@@ -326,6 +454,7 @@ impl App {
         edit::delete_font(self.edit_font);
         self.edit_font = edit::make_font(self.scale);
         edit::set_font(self.address, self.edit_font);
+        edit::set_font(self.search_edit, self.edit_font);
         if !self.edit_brush.is_invalid() {
             unsafe {
                 let _ = DeleteObject(self.edit_brush.into());
@@ -346,6 +475,20 @@ impl App {
                 self.hide_address();
             } else if vk == VK_ESCAPE.0 {
                 self.hide_address();
+            }
+        } else if id == ID_SEARCH {
+            if vk == VK_RETURN.0 {
+                self.run_search();
+            } else if vk == VK_ESCAPE.0 {
+                self.clear_search_field();
+                self.end_search(true);
+            } else if vk == VK_DOWN.0 {
+                // Down arrow moves from the field into the results.
+                unsafe {
+                    let _ = SetFocus(Some(self.hwnd));
+                }
+                let a = self.list.on_key(VK_DOWN.0, Mods::default(), self.layout.rows.h);
+                self.handle_list_action(a);
             }
         }
     }
@@ -369,6 +512,12 @@ impl App {
 
     /// Reads `path` on a worker thread. History changes only when the read succeeds.
     pub fn navigate(&mut self, path: PathBuf, kind: NavKind) {
+        if self.searching {
+            // Navigating away ends the search; the new folder replaces the results.
+            self.clear_search_field();
+            self.end_search(false);
+            self.view = self.pre_search_view;
+        }
         let generation = self.listing_gen.next();
         let (hwnd, show_hidden) = (self.send_hwnd(), self.show_hidden);
         self.loading = true;
@@ -425,9 +574,9 @@ impl App {
     /// Opens a file with its default app. Folders are handled by navigation.
     fn open_path(&mut self, _path: &Path) {}
 
-    /// Full path of a list entry (search results carry their folder relative to the listed one).
+    /// Full path of a list entry (search results carry their folder relative to the search root).
     pub fn entry_path(&self, e: &Entry) -> PathBuf {
-        let mut p = self.history.current().to_path_buf();
+        let mut p = if self.searching { self.search_root.clone() } else { self.history.current().to_path_buf() };
         if let Some(rel) = &e.rel_dir {
             p.push(rel);
         }
@@ -540,6 +689,8 @@ impl App {
             }
         } else if let Some(p) = pathbar::hit(self, x, y) {
             self.navigate(p, NavKind::Visit);
+        } else if r.search.contains(x, y) {
+            self.focus_search();
         } else if r.view_list.contains(x, y) {
             self.set_view(View::List);
         } else if r.view_cols.contains(x, y) {
@@ -573,6 +724,11 @@ impl App {
             v if v == VK_F5.0 => self.refresh(),
             v if v == VK_BACK.0 => self.go_back(),
             0x4C if mods().ctrl => self.show_address(), // Ctrl+L
+            0x46 if mods().ctrl => self.focus_search(), // Ctrl+F
+            v if v == VK_ESCAPE.0 && self.searching => {
+                self.clear_search_field();
+                self.end_search(true);
+            }
             0x31 if mods().ctrl => self.set_view(View::List), // Ctrl+1
             0x32 if mods().ctrl => self.set_view(View::Columns), // Ctrl+2
             _ if self.columns_view() => return self.column_key(vk),
@@ -610,6 +766,21 @@ impl App {
                 self.on_listing(*m);
                 Some(LRESULT(0))
             }
+            WM_TIMER if wp.0 == ID_SEARCH_TIMER => {
+                self.run_search();
+                Some(LRESULT(0))
+            }
+            WM_SEARCH_BATCH => {
+                let m = unsafe { Box::from_raw(lp.0 as *mut (u64, Vec<Entry>)) };
+                let (g, batch) = *m;
+                self.on_search_batch(g, batch);
+                Some(LRESULT(0))
+            }
+            WM_SEARCH_DONE => {
+                let m = unsafe { Box::from_raw(lp.0 as *mut (u64, search::SearchStats)) };
+                self.on_search_done(m.0, m.1);
+                Some(LRESULT(0))
+            }
             WM_COLUMN_DONE => {
                 let m = unsafe { Box::from_raw(lp.0 as *mut (PathBuf, io::Result<Vec<Entry>>)) };
                 let (path, result) = *m;
@@ -624,6 +795,11 @@ impl App {
                 let (id, code) = (wp.0 & 0xFFFF, ((wp.0 >> 16) & 0xFFFF) as u32);
                 if id == ID_ADDRESS && code == EN_KILLFOCUS {
                     self.hide_address();
+                } else if id == ID_SEARCH && code == EN_CHANGE {
+                    unsafe { SetTimer(Some(hwnd), ID_SEARCH_TIMER, SEARCH_DEBOUNCE_MS, None) };
+                } else if id == ID_SEARCH && code == EN_KILLFOCUS && edit::text(self.search_edit).trim().is_empty() {
+                    edit::hide(self.search_edit);
+                    self.invalidate();
                 }
                 Some(LRESULT(0))
             }
@@ -947,6 +1123,14 @@ pub fn run() -> Result<()> {
             address: edit::create(hwnd, ID_ADDRESS)?,
             edit_font: HFONT::default(),
             edit_brush: HBRUSH::default(),
+            search_edit: edit::create(hwnd, ID_SEARCH)?,
+            search: None,
+            search_gen: Generation::default(),
+            searching: false,
+            search_running: false,
+            search_skipped: 0,
+            search_root: start.clone(),
+            pre_search_view: View::List,
             listing_gen: Generation::default(),
             pressed_nc: 0,
             dragging_splitter: false,
