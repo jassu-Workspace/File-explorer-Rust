@@ -339,10 +339,6 @@ impl Gfx {
         }
     }
 
-    pub fn target(&self) -> Option<&ID2D1HwndRenderTarget> {
-        self.rt.as_ref()
-    }
-
     /// System image-list icon as a D2D bitmap, converted once per index and cached until device loss.
     /// `large` picks the 32 px list for high-DPI screens.
     pub fn icon(&mut self, index: i32, large: bool) -> Option<ID2D1Bitmap> {

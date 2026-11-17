@@ -131,6 +131,32 @@ pub fn nc_hit(l: &Layout, interactive: &[Rect], x: f32, y: f32, w: f32, h: f32, 
     }
 }
 
+/// A value easing from `from` to `to` (ease-out cubic).
+#[derive(Clone, Copy, Debug)]
+pub struct Anim {
+    pub from: f32,
+    pub to: f32,
+    start: std::time::Instant,
+    dur: std::time::Duration,
+}
+
+impl Anim {
+    pub fn new(from: f32, to: f32, dur: std::time::Duration, now: std::time::Instant) -> Anim {
+        Anim { from, to, start: now, dur }
+    }
+    pub fn value(&self, now: std::time::Instant) -> f32 {
+        if self.done(now) {
+            return self.to;
+        }
+        let t = now.duration_since(self.start).as_secs_f32() / self.dur.as_secs_f32();
+        let e = 1.0 - (1.0 - t).powi(3);
+        self.from + (self.to - self.from) * e
+    }
+    pub fn done(&self, now: std::time::Instant) -> bool {
+        now.duration_since(self.start) >= self.dur
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -194,5 +220,31 @@ mod tests {
         assert_eq!(hit(500.0, 20.0, false), HTCAPTION);
         assert_eq!(hit(950.0, 20.0, false), HTCLIENT);
         assert_eq!(hit(500.0, 400.0, false), HTCLIENT);
+    }
+}
+
+#[cfg(test)]
+mod anim_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn anim_eases_and_ends() {
+        let t0 = Instant::now();
+        let a = Anim::new(10.0, 110.0, Duration::from_millis(100), t0);
+        assert_eq!(a.value(t0), 10.0);
+        assert_eq!(a.value(t0 + Duration::from_millis(100)), 110.0);
+        assert_eq!(a.value(t0 + Duration::from_millis(500)), 110.0);
+        assert!(a.value(t0 + Duration::from_millis(50)) > 60.0, "ease-out is past the linear midpoint");
+        assert!(!a.done(t0 + Duration::from_millis(99)));
+        assert!(a.done(t0 + Duration::from_millis(100)));
+    }
+
+    #[test]
+    fn zero_duration_jumps() {
+        let t0 = Instant::now();
+        let a = Anim::new(0.0, 5.0, Duration::ZERO, t0);
+        assert_eq!(a.value(t0), 5.0);
+        assert!(a.done(t0));
     }
 }

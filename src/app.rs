@@ -12,7 +12,7 @@ use crate::views::{self, pathbar, toolbar::toolbar_rects};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use windows::Win32::Foundation::{HWND, LPARAM, LRESULT, POINT, RECT, WPARAM};
 use windows::Win32::Graphics::Dwm::{
     DWMSBT_MAINWINDOW, DWMWA_SYSTEMBACKDROP_TYPE, DWMWA_USE_IMMERSIVE_DARK_MODE, DwmExtendFrameIntoClientArea, DwmSetWindowAttribute,
@@ -41,6 +41,10 @@ pub const WM_SEARCH_DONE: u32 = WM_APP + 3;
 pub const WM_COLUMN_DONE: u32 = WM_APP + 4;
 const ID_SEARCH_TIMER: usize = 1;
 const SEARCH_DEBOUNCE_MS: u32 = 150;
+const ID_ANIM_TIMER: usize = 2;
+const SCROLL_ANIM: Duration = Duration::from_millis(120);
+const HOVER_ANIM: Duration = Duration::from_millis(100);
+const COLUMN_ANIM: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
@@ -130,6 +134,11 @@ pub struct App {
     search_skipped: usize,
     search_root: PathBuf,
     pre_search_view: View,
+    /// Windows "Show animations in Windows" setting.
+    animations: bool,
+    scroll_anim: Option<crate::layout::Anim>,
+    cols_anim: Option<crate::layout::Anim>,
+    hover_anim: Option<crate::layout::Anim>,
     listing_gen: Generation,
     pressed_nc: u32,
     dragging_splitter: bool,
@@ -234,8 +243,15 @@ impl App {
             self.load_column(p);
         }
         let viewport = self.layout.content.w;
-        self.columns.scroll_x = views::columns::fit_scroll(views::columns::total_width(self), viewport, self.columns.scroll_x);
-        self.columns.drop_offscreen(viewport, crate::theme::COLUMN_W);
+        let target = views::columns::fit_scroll(views::columns::total_width(self), viewport, self.columns.scroll_x);
+        if self.animations && (target - self.columns.scroll_x).abs() > 0.5 {
+            // Slide; off-screen columns are freed when the slide ends.
+            self.cols_anim = Some(crate::layout::Anim::new(self.columns.scroll_x, target, COLUMN_ANIM, Instant::now()));
+            self.start_anim_timer();
+        } else {
+            self.columns.scroll_x = target;
+            self.columns.drop_offscreen(viewport, crate::theme::COLUMN_W);
+        }
         let (rows_h, c) = (self.layout.content.h, &mut self.columns.cols[col]);
         let top = row as f32 * crate::theme::ROW_H;
         if top < c.scroll_y {
@@ -244,6 +260,55 @@ impl App {
             c.scroll_y = top + crate::theme::ROW_H - rows_h;
         }
         self.invalidate();
+    }
+
+    fn start_anim_timer(&self) {
+        unsafe { SetTimer(Some(self.hwnd), ID_ANIM_TIMER, 16, None) };
+    }
+
+    /// Advances running animations; stops the timer when none are left, so idle CPU stays at zero.
+    fn tick(&mut self) {
+        let now = Instant::now();
+        if let Some(a) = self.scroll_anim {
+            self.list.scroll_y = a.value(now);
+            if a.done(now) {
+                self.scroll_anim = None;
+            }
+        }
+        if let Some(a) = self.cols_anim {
+            self.columns.scroll_x = a.value(now);
+            if a.done(now) {
+                self.cols_anim = None;
+                self.columns.drop_offscreen(self.layout.content.w, crate::theme::COLUMN_W);
+            }
+        }
+        if self.hover_anim.is_some_and(|a| a.done(now)) {
+            self.hover_anim = None;
+        }
+        if self.scroll_anim.is_none() && self.cols_anim.is_none() && self.hover_anim.is_none() {
+            unsafe {
+                let _ = KillTimer(Some(self.hwnd), ID_ANIM_TIMER);
+            }
+        }
+        self.invalidate();
+    }
+
+    /// Opacity of the row hover highlight while it fades in.
+    pub fn hover_alpha(&self) -> f32 {
+        self.hover_anim.map_or(1.0, |a| a.value(Instant::now()))
+    }
+
+    fn list_wheel(&mut self, notches: f32) {
+        let (cur, h) = (self.list.scroll_y, self.layout.rows.h);
+        // Repeated notches extend the running animation's target instead of restarting from the current frame.
+        self.list.scroll_y = self.scroll_anim.map_or(cur, |a| a.to);
+        self.list.on_wheel(notches, h);
+        let target = self.list.scroll_y;
+        if self.animations {
+            self.list.scroll_y = cur;
+            self.scroll_anim = Some(crate::layout::Anim::new(cur, target, SCROLL_ANIM, Instant::now()));
+            self.start_anim_timer();
+        }
     }
 
     /// Wheel scrolls the column under the cursor; Shift+wheel scrolls across columns.
@@ -379,7 +444,7 @@ impl App {
     }
 
     fn on_search_done(&mut self, generation: u64, stats: search::SearchStats) {
-        if !self.searching || !self.search_gen.is_current(generation) {
+        if stats.cancelled || !self.searching || !self.search_gen.is_current(generation) {
             return;
         }
         self.search_running = false;
@@ -1032,6 +1097,10 @@ impl App {
             0x32 if mods().ctrl => self.set_view(View::Columns), // Ctrl+2
             _ if self.columns_view() => return self.column_key(vk),
             _ => {
+                // Keyboard moves set the scroll directly; a running wheel animation would fight them.
+                if let Some(a) = self.scroll_anim.take() {
+                    self.list.scroll_y = a.to;
+                }
                 let a = self.list.on_key(vk, mods(), self.layout.rows.h);
                 if a == ListAction::None {
                     return false;
@@ -1067,6 +1136,10 @@ impl App {
             }
             WM_CONTEXTMENU => {
                 self.on_context_menu(lp);
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wp.0 == ID_ANIM_TIMER => {
+                self.tick();
                 Some(LRESULT(0))
             }
             WM_TIMER if wp.0 == ID_SEARCH_TIMER => {
@@ -1205,6 +1278,10 @@ impl App {
                 let rows = self.layout.rows;
                 let hover = if rows.contains(x, y) { self.list.row_at(y - rows.y) } else { None };
                 let side = self.sidebar.hit(x, y, self.layout.sidebar);
+                if hover != self.list.hover_row && hover.is_some() && self.animations {
+                    self.hover_anim = Some(crate::layout::Anim::new(0.0, 1.0, HOVER_ANIM, Instant::now()));
+                    self.start_anim_timer();
+                }
                 if hover != self.list.hover_row || side != self.sidebar.hover {
                     self.list.hover_row = hover;
                     self.sidebar.hover = side;
@@ -1271,7 +1348,7 @@ impl App {
                 if self.columns_view() {
                     self.column_wheel(notches, lp);
                 } else {
-                    self.list.on_wheel(notches, self.layout.rows.h);
+                    self.list_wheel(notches);
                 }
                 self.invalidate();
                 Some(LRESULT(0))
@@ -1364,6 +1441,12 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
     }
 }
 
+fn animations_enabled() -> bool {
+    let mut on = BOOL::from(true);
+    let ok = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut BOOL as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) };
+    ok.is_err() || on.as_bool()
+}
+
 fn start_folder() -> PathBuf {
     shell::favorites().into_iter().next().map(|p| p.path).unwrap_or_else(|| PathBuf::from("C:\\"))
 }
@@ -1442,6 +1525,10 @@ pub fn run() -> Result<()> {
             search_skipped: 0,
             search_root: start.clone(),
             pre_search_view: View::List,
+            animations: animations_enabled(),
+            scroll_anim: None,
+            cols_anim: None,
+            hover_anim: None,
             listing_gen: Generation::default(),
             pressed_nc: 0,
             dragging_splitter: false,

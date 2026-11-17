@@ -229,7 +229,7 @@ pub fn paint(app: &mut App) {
         if selected {
             app.gfx.fill_round(bg, 5.0, t.accent);
         } else if app.list.hover_row == Some(i) {
-            app.gfx.fill_round(bg, 5.0, t.hover);
+            app.gfx.fill_round(bg, 5.0, t.hover.with_alpha(t.hover.a * app.hover_alpha()));
         }
         let (fg, dim) = if selected { (t.selection_text, t.selection_text.with_alpha(0.85)) } else { (t.text, t.text_dim) };
         let e = &app.list.entries[i];

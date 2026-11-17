@@ -32,7 +32,6 @@ pub fn status_text(running: bool, matched: usize, skipped: usize) -> String {
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct SearchStats {
-    pub matched: usize,
     pub skipped_denied: usize,
     pub cancelled: bool,
 }
@@ -69,7 +68,6 @@ struct Shared {
     cv: Condvar,
     pending: Mutex<(Vec<Entry>, Instant)>,
     cancel: Arc<AtomicBool>,
-    matched: AtomicUsize,
     denied: AtomicUsize,
     alive: AtomicUsize,
     on_batch: BatchFn,
@@ -93,7 +91,6 @@ pub fn start_search(
         cv: Condvar::new(),
         pending: Mutex::new((Vec::new(), Instant::now())),
         cancel: cancel.clone(),
-        matched: AtomicUsize::new(0),
         denied: AtomicUsize::new(0),
         alive: AtomicUsize::new(n),
         on_batch: Box::new(on_batch),
@@ -130,7 +127,7 @@ fn worker(s: &Shared) {
         if !cancelled && !rest.is_empty() {
             (s.on_batch)(rest);
         }
-        let stats = SearchStats { matched: s.matched.load(SeqCst), skipped_denied: s.denied.load(SeqCst), cancelled };
+        let stats = SearchStats { skipped_denied: s.denied.load(SeqCst), cancelled };
         if let Some(done) = s.on_done.lock().unwrap().take() {
             done(stats);
         }
@@ -169,7 +166,6 @@ fn scan(s: &Shared, dir: &PathBuf) {
     if hits.is_empty() {
         return;
     }
-    s.matched.fetch_add(hits.len(), SeqCst);
     let ready = {
         let mut p = s.pending.lock().unwrap();
         p.0.append(&mut hits);
@@ -241,7 +237,6 @@ mod tests {
         let (mut v, s) = run(&d, "report", true);
         v.sort_by(|x, y| x.name.cmp(&y.name));
         assert_eq!(v.len(), 2);
-        assert_eq!(s.matched, 2);
         assert!(!s.cancelled);
         assert_eq!(v[0].name, "REPORT2.md");
         assert_eq!(v[0].rel_dir.as_deref(), Some(Path::new(r"a\b")));

@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::ffi::{OsStr, OsString};
+use std::ffi::OsString;
 use std::io;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -63,11 +63,7 @@ pub enum SortKey {
     Kind,
 }
 
-/// Case-insensitive; digit runs compare by numeric value.
-pub fn natural_cmp(a: &OsStr, b: &OsStr) -> Ordering {
-    nat_str(&a.to_string_lossy().to_lowercase(), &b.to_string_lossy().to_lowercase())
-}
-
+/// Natural order on lowercased names: digit runs compare by numeric value.
 fn nat_str(a: &str, b: &str) -> Ordering {
     let (mut x, mut y) = (a.as_bytes(), b.as_bytes());
     loop {
@@ -139,7 +135,7 @@ pub fn sort_entries(entries: &mut [Entry], key: SortKey, descending: bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::{OsStr, OsString};
+
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::process::Command;
@@ -210,7 +206,6 @@ mod tests {
         let n = names(&v);
         assert!(n.iter().position(|x| x == "alpha") < n.iter().position(|x| x == "Zeta"));
         assert_eq!(n.len(), 5);
-        assert_eq!(natural_cmp(OsStr::new("a"), &OsString::from("A")), std::cmp::Ordering::Equal);
     }
 
     #[test]
