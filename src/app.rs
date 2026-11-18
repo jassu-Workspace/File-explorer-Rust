@@ -1953,6 +1953,19 @@ fn start_folder() -> PathBuf {
     shell::home().unwrap_or_else(|| PathBuf::from("C:\\"))
 }
 
+/// Folder to open from the command line (`fexplorer.exe <folder-or-file>`); a file opens its folder with the file selected.
+fn start_target(arg: Option<std::ffi::OsString>) -> Option<(PathBuf, Option<std::ffi::OsString>)> {
+    let raw = arg?.to_string_lossy().trim().trim_matches('"').to_string();
+    let p = PathBuf::from(raw);
+    if p.is_dir() {
+        Some((p, None))
+    } else if p.is_file() {
+        Some((p.parent()?.to_path_buf(), p.file_name().map(|n| n.to_os_string())))
+    } else {
+        None
+    }
+}
+
 pub fn run() -> Result<()> {
     unsafe {
         let hinst = GetModuleHandleW(None)?;
@@ -1963,6 +1976,8 @@ pub fn run() -> Result<()> {
             lpfnWndProc: Some(wndproc),
             hInstance: hinst.into(),
             hCursor: LoadCursorW(None, IDC_ARROW)?,
+            // Icon resource 1 from app.rc (taskbar and Alt+Tab); absent when built without the Windows SDK.
+            hIcon: LoadIconW(Some(hinst.into()), PCWSTR(std::ptr::without_provenance(1))).unwrap_or_default(),
             lpszClassName: class,
             ..Default::default()
         };
@@ -1991,7 +2006,7 @@ pub fn run() -> Result<()> {
         let margins = if mica { MARGINS { cxLeftWidth: -1, cxRightWidth: -1, cyTopHeight: -1, cyBottomHeight: -1 } } else { MARGINS { cyTopHeight: 1, ..Default::default() } };
         let _ = DwmExtendFrameIntoClientArea(hwnd, &margins);
 
-        let start = start_folder();
+        let (start, select) = start_target(std::env::args_os().nth(1)).unwrap_or_else(|| (start_folder(), None));
         let mut app = Box::new(App {
             hwnd,
             gfx: Gfx::new()?,
@@ -2055,6 +2070,7 @@ pub fn run() -> Result<()> {
         app.apply_theme_to_frame();
         app.show_pathbar = app.prefs.get("@pathbar") == Some("1");
         app.rebuild_edit_style();
+        app.pending_select = select;
         app.navigate(start, NavKind::Refresh);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
         // Re-run WM_NCCALCSIZE, then size the window for this monitor's DPI.
@@ -2075,6 +2091,19 @@ mod tests {
     use super::*;
     use crate::draw::Glyph;
     use crate::shell::Place;
+
+    #[test]
+    fn start_target_from_command_line() {
+        let d = std::env::temp_dir().join(format!("fx-arg-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("f.txt"), "").unwrap();
+        assert_eq!(start_target(Some(d.clone().into_os_string())), Some((d.clone(), None)));
+        assert_eq!(start_target(Some(d.join("f.txt").into_os_string())), Some((d.clone(), Some("f.txt".into()))), "a file opens its folder with the file selected");
+        assert_eq!(start_target(Some(format!("\"{}\"", d.display()).into())), Some((d.clone(), None)), "stray quotes are stripped");
+        assert_eq!(start_target(Some(d.join("missing").into_os_string())), None);
+        assert_eq!(start_target(None), None);
+        std::fs::remove_dir_all(d).unwrap();
+    }
 
     #[test]
     fn folder_title_uses_cached_drive_names() {
