@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::draw::Glyph;
+use crate::draw::{Glyph, IconSize};
 use crate::format::{format_modified, format_size};
 use crate::layout::{Rect, row_at, visible_rows};
 use crate::listing::{Entry, SortKey, sort_entries};
@@ -130,10 +130,6 @@ impl ListView {
         (self.entries.len() as f32 * ROW_H - viewport_h).max(0.0)
     }
 
-    pub fn on_wheel(&mut self, notches: f32, viewport_h: f32) {
-        self.scroll_y = (self.scroll_y - notches * 3.0 * ROW_H).clamp(0.0, self.max_scroll(viewport_h));
-    }
-
     pub fn ensure_visible(&mut self, i: usize, viewport_h: f32) {
         let top = i as f32 * ROW_H;
         if top < self.scroll_y {
@@ -242,7 +238,7 @@ pub fn paint(app: &mut App) {
                         app.gfx.glyph(Glyph::Folder, icon, if selected { fg } else { t.accent });
                     } else {
                         let idx = shell::icon_index(e, &mut app.icon_idx);
-                        if let Some(b) = app.gfx.icon(idx, large) {
+                        if let Some(b) = app.gfx.icon(idx, if large { IconSize::Large } else { IconSize::Small }) {
                             app.gfx.bitmap(&b, icon);
                         }
                     }
@@ -274,7 +270,7 @@ pub fn paint(app: &mut App) {
 
 /// Error banner, or the empty-folder note.
 pub fn paint_message(app: &App) {
-    let (rows, t) = (if app.columns_view() { app.layout.content } else { app.layout.rows }, app.theme);
+    let (rows, t) = (if app.view == crate::app::View::List { app.layout.rows } else { app.layout.content }, app.theme);
     if let Some(msg) = &app.error {
         let banner = Rect::new(rows.x + 16.0, rows.y + 12.0, rows.w - 32.0, 36.0);
         // Opaque, so rows underneath do not show through the message.
@@ -341,18 +337,6 @@ mod tests {
         assert!(matches!(l.on_key(VK_RETURN.0, NONE, 240.0), ListAction::Open(99)));
         l.on_key(0x41, Mods { ctrl: true, shift: false }, 240.0);
         assert_eq!(l.sel.selected().len(), 100);
-    }
-
-    #[test]
-    fn wheel_clamps() {
-        let mut l = lv();
-        l.on_wheel(-1000.0, 240.0);
-        assert_eq!(l.scroll_y, l.max_scroll(240.0));
-        l.on_wheel(1000.0, 240.0);
-        assert_eq!(l.scroll_y, 0.0);
-        let mut empty = ListView::default();
-        empty.on_wheel(-3.0, 240.0);
-        assert_eq!(empty.scroll_y, 0.0);
     }
 
     #[test]

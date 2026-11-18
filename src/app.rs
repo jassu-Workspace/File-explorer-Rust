@@ -49,6 +49,7 @@ const COLUMN_ANIM: Duration = Duration::from_millis(150);
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
+    Icon,
     List,
     Columns,
 }
@@ -111,6 +112,8 @@ pub struct App {
     pub history: History,
     pub list: ListView,
     pub view: View,
+    /// Icon-view icon size in DIPs (Ctrl+Plus / Ctrl+Minus).
+    pub icon_size: f32,
     pub columns: Columns,
     pub error: Option<String>,
     pub loading: bool,
@@ -304,12 +307,72 @@ impl App {
         self.hover_anim.map_or(1.0, |a| a.value(Instant::now()))
     }
 
+    pub fn grid(&self) -> views::grid::Grid {
+        views::grid::Grid::new(self.layout.content.w, self.icon_size)
+    }
+
+    fn zoom_icons(&mut self, delta: f32) {
+        self.icon_size = views::grid::clamp_icon(self.icon_size + delta);
+        if let Some(f) = self.list.sel.focus() {
+            self.reveal(f);
+        }
+        self.list.scroll_y = self.list.scroll_y.min(self.max_scroll());
+        self.invalidate();
+    }
+
+    /// Area holding the items of the list or icon view.
+    fn item_area(&self) -> crate::layout::Rect {
+        if self.view == View::Icon { self.layout.content } else { self.layout.rows }
+    }
+
+    /// `None` outside the item area; `Some(None)` on empty space inside it.
+    fn item_at(&self, x: f32, y: f32) -> Option<Option<usize>> {
+        let a = self.item_area();
+        if self.columns_view() || !a.contains(x, y) {
+            return None;
+        }
+        Some(match self.view {
+            View::Icon => self.grid().cell_at(x - a.x, y - a.y, self.list.scroll_y, self.list.entries.len()),
+            _ => self.list.row_at(y - a.y),
+        })
+    }
+
+    /// Where an item's name is drawn (inline rename and keyboard context menus anchor here).
+    fn name_rect(&self, i: usize) -> crate::layout::Rect {
+        let a = self.item_area();
+        if self.view == View::Icon {
+            let g = self.grid();
+            let c = g.cell(i);
+            return crate::layout::Rect::new(a.x + c.x + 4.0, a.y + c.y - self.list.scroll_y + 16.0 + g.icon, c.w - 8.0, 20.0);
+        }
+        let name_w = views::list::columns(a.w, self.list.show_where)[0].2;
+        let y = a.y + i as f32 * crate::theme::ROW_H - self.list.scroll_y;
+        crate::layout::Rect::new(a.x + 32.0, y, name_w - 40.0, crate::theme::ROW_H)
+    }
+
+    fn max_scroll(&self) -> f32 {
+        let h = self.item_area().h;
+        match self.view {
+            View::Icon => (self.grid().content_h(self.list.entries.len()) - h).max(0.0),
+            _ => self.list.max_scroll(h),
+        }
+    }
+
+    /// Scrolls so item `i` is fully visible.
+    fn reveal(&mut self, i: usize) {
+        let h = self.item_area().h;
+        match self.view {
+            View::Icon => self.list.scroll_y = self.grid().scroll_to_show(i, self.list.scroll_y, h),
+            _ => self.list.ensure_visible(i, h),
+        }
+    }
+
     fn list_wheel(&mut self, notches: f32) {
-        let (cur, h) = (self.list.scroll_y, self.layout.rows.h);
+        let cur = self.list.scroll_y;
         // Repeated notches extend the running animation's target instead of restarting from the current frame.
-        self.list.scroll_y = self.scroll_anim.map_or(cur, |a| a.to);
-        self.list.on_wheel(notches, h);
-        let target = self.list.scroll_y;
+        let base = self.scroll_anim.map_or(cur, |a| a.to);
+        let target = (base - notches * 3.0 * crate::theme::ROW_H).clamp(0.0, self.max_scroll());
+        self.list.scroll_y = target;
         if self.animations {
             self.list.scroll_y = cur;
             self.scroll_anim = Some(crate::layout::Anim::new(cur, target, SCROLL_ANIM, Instant::now()));
@@ -389,6 +452,7 @@ impl App {
     /// Active segment of the view control: Icon, List, Columns, Gallery.
     pub fn view_index(&self) -> usize {
         match self.view {
+            View::Icon => 0,
             View::List => 1,
             View::Columns => 2,
         }
@@ -768,11 +832,8 @@ impl App {
             return;
         }
         let Some(i) = self.list.sel.focus().filter(|&i| i < self.list.entries.len()) else { return };
-        self.list.ensure_visible(i, self.layout.rows.h);
-        let rows = self.layout.rows;
-        let name_w = views::list::columns(rows.w, self.list.show_where)[0].2;
-        let y = rows.y + i as f32 * crate::theme::ROW_H - self.list.scroll_y;
-        let r = crate::layout::Rect::new(rows.x + 10.0 + 24.0 - 2.0, y, name_w - 40.0, crate::theme::ROW_H);
+        self.reveal(i);
+        let r = self.name_rect(i);
         let e = &self.list.entries[i];
         let name = e.name.to_string_lossy().into_owned();
         // Select the stem so typing keeps the extension, like Explorer.
@@ -830,7 +891,7 @@ impl App {
         let Some(name) = rename.clone().or_else(|| self.pending_select.take()) else { return };
         if let Some(i) = self.list.entries.iter().position(|e| e.name == name) {
             self.list.click_row(i, Mods::default());
-            self.list.ensure_visible(i, self.layout.rows.h);
+            self.reveal(i);
             if rename.is_some() {
                 self.start_rename();
             }
@@ -843,9 +904,12 @@ impl App {
         let mut on_item = false;
         if keyboard {
             // Shift+F10 / Menu key: anchor at the focused row.
-            let rows = self.layout.rows;
-            let y = self.list.sel.focus().map_or(rows.y, |i| rows.y + (i as f32 + 0.5) * crate::theme::ROW_H - self.list.scroll_y);
-            screen = POINT { x: ((rows.x + 40.0) * self.scale) as i32, y: (y * self.scale) as i32 };
+            let a = self.item_area();
+            let (x, y) = self.list.sel.focus().map_or((a.x + 40.0, a.y), |i| {
+                let r = self.name_rect(i);
+                (r.x + 8.0, r.y + r.h / 2.0)
+            });
+            screen = POINT { x: (x * self.scale) as i32, y: (y * self.scale) as i32 };
             unsafe {
                 let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut screen);
             }
@@ -864,8 +928,8 @@ impl App {
                     self.columns.focus_col = col;
                     on_item = true;
                 }
-            } else if self.layout.rows.contains(x, y) {
-                if let Some(i) = self.list.row_at(y - self.layout.rows.y) {
+            } else if let Some(hit) = self.item_at(x, y) {
+                if let Some(i) = hit {
                     if !self.list.sel.is_selected(i) {
                         self.list.click_row(i, Mods::default());
                     }
@@ -972,15 +1036,19 @@ impl App {
     fn handle_list_action(&mut self, a: ListAction) {
         match a {
             ListAction::Open(i) => self.open_index(i),
-            ListAction::Redraw => self.invalidate(),
+            ListAction::Redraw => {
+                if let Some(f) = self.list.sel.focus() {
+                    self.reveal(f);
+                }
+                self.invalidate();
+            }
             ListAction::None => {}
         }
     }
 
     fn relayout(&mut self) {
         self.layout = compute_layout(self.w, self.h, self.sidebar_w, 1.0);
-        let max = self.list.max_scroll(self.layout.rows.h);
-        self.list.scroll_y = self.list.scroll_y.min(max);
+        self.list.scroll_y = self.list.scroll_y.min(self.max_scroll());
     }
 
     fn apply_theme_to_frame(&self) {
@@ -1063,13 +1131,13 @@ impl App {
                     }
                 }
             }
-        } else if l.header.contains(x, y) {
+        } else if self.view == View::List && l.header.contains(x, y) {
             if let Some(c) = self.list.col_at(x - l.header.x, l.header.w) {
                 self.list.click_header(c);
                 self.invalidate();
             }
-        } else if l.rows.contains(x, y) {
-            match self.list.row_at(y - l.rows.y) {
+        } else if let Some(hit) = self.item_at(x, y) {
+            match hit {
                 Some(i) => self.list.click_row(i, mods()),
                 None => self.list.sel.clear(),
             }
@@ -1081,6 +1149,7 @@ impl App {
         match tool {
             Hot::Back => self.go_back(),
             Hot::Forward => self.go_forward(),
+            Hot::View(0) => self.set_view(View::Icon),
             Hot::View(1) => self.set_view(View::List),
             Hot::View(2) => self.set_view(View::Columns),
             Hot::Search => self.focus_search(),
@@ -1113,8 +1182,27 @@ impl App {
                 self.clear_search_field();
                 self.end_search(true);
             }
-            0x31 if mods().ctrl => self.set_view(View::List), // Ctrl+1
-            0x32 if mods().ctrl => self.set_view(View::Columns), // Ctrl+2
+            0x31 if mods().ctrl => self.set_view(View::Icon), // Ctrl+1
+            0x32 if mods().ctrl => self.set_view(View::List), // Ctrl+2
+            0x33 if mods().ctrl => self.set_view(View::Columns), // Ctrl+3
+            0xBB | 0x6B if mods().ctrl && self.view == View::Icon => self.zoom_icons(16.0), // Ctrl+Plus
+            0xBD | 0x6D if mods().ctrl && self.view == View::Icon => self.zoom_icons(-16.0), // Ctrl+Minus
+            v if self.view == View::Icon && [VK_LEFT.0, VK_RIGHT.0, VK_UP.0, VK_DOWN.0].contains(&v) => {
+                use views::grid::Dir;
+                let d = match v {
+                    v if v == VK_LEFT.0 => Dir::Left,
+                    v if v == VK_RIGHT.0 => Dir::Right,
+                    v if v == VK_UP.0 => Dir::Up,
+                    _ => Dir::Down,
+                };
+                let n = self.list.entries.len();
+                if n > 0 {
+                    let next = self.grid().step(self.list.sel.focus(), d, n);
+                    if mods().shift { self.list.sel.shift_click(next) } else { self.list.sel.click(next) }
+                    self.reveal(next);
+                    self.invalidate();
+                }
+            }
             _ if self.columns_view() => return self.column_key(vk),
             _ => {
                 // Keyboard moves set the scroll directly; a running wheel animation would fight them.
@@ -1295,8 +1383,7 @@ impl App {
                 }
                 self.track_leave(false);
                 self.set_hot(self.hot_at(x, y));
-                let rows = self.layout.rows;
-                let hover = if rows.contains(x, y) { self.list.row_at(y - rows.y) } else { None };
+                let hover = self.item_at(x, y).flatten();
                 let side = self.sidebar.hit(x, y, self.layout.sidebar);
                 let header = self.sidebar.header_at(x, y, self.layout.sidebar);
                 if header != self.sidebar.hover_header {
@@ -1324,7 +1411,6 @@ impl App {
             }
             WM_LBUTTONDBLCLK => {
                 let (x, y) = self.client_dip(lp);
-                let rows = self.layout.rows;
                 if self.columns_view() && self.layout.content.contains(x, y) {
                     // Folders already opened on the first click; a double-click opens files.
                     if let Some((col, Some(row))) = views::columns::hit(self, x, y) {
@@ -1334,10 +1420,7 @@ impl App {
                             self.open_path(&path);
                         }
                     }
-                } else if !self.columns_view()
-                    && rows.contains(x, y)
-                    && let Some(i) = self.list.row_at(y - rows.y)
-                {
+                } else if let Some(Some(i)) = self.item_at(x, y) {
                     self.open_index(i);
                 } else if self.toolbar().title.contains(x, y) {
                     self.show_address();
@@ -1528,7 +1611,8 @@ pub fn run() -> Result<()> {
             hot: Hot::None,
             history: History::new(start.clone()),
             list: ListView::default(),
-            view: View::List,
+            view: View::Icon,
+            icon_size: views::grid::ICON_DEFAULT,
             columns: Columns::default(),
             error: None,
             loading: false,
@@ -1551,7 +1635,7 @@ pub fn run() -> Result<()> {
             search_running: false,
             search_skipped: 0,
             search_root: start.clone(),
-            pre_search_view: View::List,
+            pre_search_view: View::Icon,
             animations: animations_enabled(),
             scroll_anim: None,
             cols_anim: None,

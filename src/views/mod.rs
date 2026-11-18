@@ -1,4 +1,5 @@
 pub mod columns;
+pub mod grid;
 pub mod list;
 pub mod pathbar;
 pub mod sidebar;
@@ -18,11 +19,16 @@ pub fn paint(app: &mut App) {
     }
     toolbar::paint(app);
     sidebar::paint(app);
-    if app.columns_view() {
-        columns::paint(app);
-        list::paint_message(app);
-    } else {
-        list::paint(app);
+    match app.view {
+        crate::app::View::Columns => {
+            columns::paint(app);
+            list::paint_message(app);
+        }
+        crate::app::View::Icon => {
+            grid::paint(app);
+            list::paint_message(app);
+        }
+        crate::app::View::List => list::paint(app),
     }
     {
         let (g, t, l) = (&app.gfx, &app.theme, &app.layout);

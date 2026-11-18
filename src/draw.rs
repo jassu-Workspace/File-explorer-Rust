@@ -14,7 +14,7 @@ use windows::Win32::Graphics::Imaging::{
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::Controls::{IImageList, ILD_NORMAL};
-use windows::Win32::UI::Shell::{SHGetImageList, SHIL_LARGE, SHIL_SMALL};
+use windows::Win32::UI::Shell::{SHGetImageList, SHIL_JUMBO, SHIL_LARGE, SHIL_SMALL};
 use windows::Win32::UI::WindowsAndMessaging::DestroyIcon;
 use windows::core::{Result, w};
 use windows_numerics::{Matrix3x2, Vector2};
@@ -164,6 +164,24 @@ fn build_geometry(f: &ID2D1Factory, path: &str) -> Result<(ID2D1PathGeometry, bo
     Ok((geo, filled))
 }
 
+/// System image-list sizes: 16, 32 and 256 px.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IconSize {
+    Small,
+    Large,
+    Jumbo,
+}
+
+impl IconSize {
+    fn list(self) -> u32 {
+        match self {
+            IconSize::Small => SHIL_SMALL,
+            IconSize::Large => SHIL_LARGE,
+            IconSize::Jumbo => SHIL_JUMBO,
+        }
+    }
+}
+
 pub struct Fonts {
     pub body: IDWriteTextFormat,
     pub body_right: IDWriteTextFormat,
@@ -172,6 +190,8 @@ pub struct Fonts {
     pub small_right: IDWriteTextFormat,
     pub big: IDWriteTextFormat,
     pub caption: IDWriteTextFormat,
+    /// Icon-view names: centered, wraps, ellipsis after two lines.
+    pub cell: IDWriteTextFormat,
 }
 
 fn text_format(dw: &IDWriteFactory, size: f32, weight: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT) -> Result<IDWriteTextFormat> {
@@ -219,6 +239,14 @@ impl Gfx {
             small_right: text_format(&dw, 11.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
             big: text_format(&dw, 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?,
             caption: text_format(&dw, 10.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+            cell: {
+                let f = text_format(&dw, 12.0, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER)?;
+                unsafe {
+                    f.SetWordWrapping(DWRITE_WORD_WRAPPING_EMERGENCY_BREAK)?;
+                    f.SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_NEAR)?;
+                }
+                f
+            },
         };
         let mut glyphs = HashMap::new();
         for g in ALL_GLYPHS {
@@ -325,6 +353,16 @@ impl Gfx {
         }
     }
 
+    /// Size of `s` laid out inside a `max_w` x `max_h` box (wrapping formats can take several lines).
+    pub fn measure_box(&self, s: &str, f: &IDWriteTextFormat, max_w: f32, max_h: f32) -> (f32, f32) {
+        let w: Vec<u16> = s.encode_utf16().collect();
+        unsafe {
+            let Ok(layout) = self.dw.CreateTextLayout(&w, f, max_w, max_h) else { return (0.0, 0.0) };
+            let mut m = DWRITE_TEXT_METRICS::default();
+            if layout.GetMetrics(&mut m).is_ok() { (m.width.min(max_w), m.height.min(max_h)) } else { (0.0, 0.0) }
+        }
+    }
+
     pub fn measure(&self, s: &str, f: &IDWriteTextFormat) -> f32 {
         let w: Vec<u16> = s.encode_utf16().collect();
         unsafe {
@@ -367,24 +405,24 @@ impl Gfx {
 
     /// System image-list icon as a D2D bitmap, converted once per index and cached until device loss.
     /// `large` picks the 32 px list for high-DPI screens.
-    pub fn icon(&mut self, index: i32, large: bool) -> Option<ID2D1Bitmap> {
-        let key = if large { index | (1 << 30) } else { index };
+    pub fn icon(&mut self, index: i32, size: IconSize) -> Option<ID2D1Bitmap> {
+        let key = index | ((size.list() as i32) << 28);
         if let Some(b) = self.icons.get(&key) {
             return b.clone();
         }
-        let b = self.load_icon(index, large).ok();
+        let b = self.load_icon(index, size).ok();
         self.icons.insert(key, b.clone());
         b
     }
 
-    fn load_icon(&mut self, index: i32, large: bool) -> Result<ID2D1Bitmap> {
+    fn load_icon(&mut self, index: i32, size: IconSize) -> Result<ID2D1Bitmap> {
         let rt = self.rt.as_ref().ok_or_else(windows::core::Error::empty)?;
         if self.wic.is_none() {
             self.wic = Some(unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? });
         }
         let wic = self.wic.as_ref().unwrap();
         unsafe {
-            let list: IImageList = SHGetImageList((if large { SHIL_LARGE } else { SHIL_SMALL }) as i32)?;
+            let list: IImageList = SHGetImageList(size.list() as i32)?;
             let hicon = list.GetIcon(index, ILD_NORMAL.0)?;
             let src = wic.CreateBitmapFromHICON(hicon);
             let _ = DestroyIcon(hicon);

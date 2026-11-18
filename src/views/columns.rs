@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::draw::Glyph;
+use crate::draw::{Glyph, IconSize};
 use crate::format::{format_modified, format_size};
 use crate::layout::{Rect, row_at, visible_rows};
 use crate::listing::Entry;
@@ -73,7 +73,7 @@ pub fn paint(app: &mut App) {
                 app.gfx.glyph(Glyph::Chevron, Rect::new(r.right() - 22.0, y + 7.0, 10.0, 10.0), if sel && focused { fg } else { t.text_dim });
             } else {
                 let idx = shell::icon_index(e, &mut app.icon_idx);
-                if let Some(b) = app.gfx.icon(idx, large) {
+                if let Some(b) = app.gfx.icon(idx, if large { IconSize::Large } else { IconSize::Small }) {
                     app.gfx.bitmap(&b, icon);
                 }
             }
@@ -93,7 +93,7 @@ fn paint_info(app: &mut App) {
     let x = col_rect(app, app.columns.cols.len()).x;
     let c = app.layout.content;
     let idx = shell::icon_index(&e, &mut app.icon_idx);
-    if let Some(b) = app.gfx.icon(idx, true) {
+    if let Some(b) = app.gfx.icon(idx, IconSize::Jumbo) {
         app.gfx.bitmap(&b, Rect::new(x + (INFO_W - 64.0) / 2.0, c.y + 32.0, 64.0, 64.0));
     }
     let name = shell::display_name(&e);
