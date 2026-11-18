@@ -5,13 +5,12 @@ use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use windows::Win32::Foundation::{HWND, LPARAM, POINT, POINTL, WPARAM};
 use windows::Win32::Graphics::Gdi::ScreenToClient;
-use windows::Win32::System::Com::{CoTaskMemFree, DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL};
+use windows::Win32::System::Com::{DVASPECT_CONTENT, FORMATETC, IDataObject, TYMED_HGLOBAL};
 use windows::Win32::System::Ole::{CF_HDROP, DROPEFFECT, DROPEFFECT_COPY, DROPEFFECT_MOVE, DROPEFFECT_NONE, IDropTarget, IDropTarget_Impl, ReleaseStgMedium};
 use windows::Win32::System::SystemServices::{MK_CONTROL, MK_SHIFT, MODIFIERKEYS_FLAGS};
-use windows::Win32::UI::Shell::Common::ITEMIDLIST;
-use windows::Win32::UI::Shell::{BHID_DataObject, HDROP, SHCreateShellItemArrayFromIDLists, SHDoDragDrop, SHParseDisplayName};
+use windows::Win32::UI::Shell::{HDROP, SHDoDragDrop};
 use windows::Win32::UI::WindowsAndMessaging::SendMessageW;
-use windows::core::{HSTRING, Ref, implement};
+use windows::core::{Ref, implement};
 
 /// Sent synchronously to the window while a drag is over it; `lparam` is `*mut Query`.
 pub const WM_DRAG_QUERY: u32 = windows::Win32::UI::WindowsAndMessaging::WM_APP + 7;
@@ -127,21 +126,8 @@ impl IDropTarget_Impl for Target_Impl {
 
 /// Drags `paths` out of the window (modal until the drop). Explorer and other apps receive normal shell items.
 pub fn drag_out(hwnd: HWND, paths: &[PathBuf]) {
-    let mut pidls: Vec<*const ITEMIDLIST> = Vec::new();
-    for p in paths {
-        let mut pidl = std::ptr::null_mut();
-        if unsafe { SHParseDisplayName(&HSTRING::from(p.as_os_str()), None, &mut pidl, 0, None) }.is_ok() {
-            pidls.push(pidl);
-        }
-    }
-    if !pidls.is_empty()
-        && let Ok(arr) = unsafe { SHCreateShellItemArrayFromIDLists(&pidls) }
-        && let Ok(data) = unsafe { arr.BindToHandler::<_, IDataObject>(None, &BHID_DataObject) }
-    {
+    if let Some(data) = crate::tools::data_object(paths) {
         let _ = unsafe { SHDoDragDrop(Some(hwnd), &data, None, DROPEFFECT_COPY | DROPEFFECT_MOVE) };
-    }
-    for p in pidls {
-        unsafe { CoTaskMemFree(Some(p as _)) };
     }
 }
 

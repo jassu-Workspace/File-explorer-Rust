@@ -58,6 +58,10 @@ impl Selection {
     pub fn select_all(&mut self, count: usize) {
         self.sel = (0..count).collect();
     }
+    /// Selects what was not selected and clears the rest (Explorer's Invert selection).
+    pub fn invert(&mut self, count: usize) {
+        self.sel = (0..count).filter(|i| self.sel.binary_search(i).is_err()).collect();
+    }
     pub fn is_selected(&self, i: usize) -> bool {
         self.sel.binary_search(&i).is_ok()
     }
@@ -134,6 +138,16 @@ mod tests {
         s.set(vec![7, 2, 7]);
         assert_eq!(s.selected(), [2, 7]);
         assert_eq!(s.focus(), Some(4));
+    }
+
+    #[test]
+    fn invert_flips_each_item() {
+        let mut s = Selection::new();
+        s.set(vec![0, 2]);
+        s.invert(5);
+        assert_eq!(s.selected(), [1, 3, 4]);
+        s.invert(5);
+        assert_eq!(s.selected(), [0, 2]);
     }
 
     #[test]

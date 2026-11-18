@@ -1592,6 +1592,58 @@ impl App {
         self.invalidate();
     }
 
+    fn copy_as_path(&mut self) {
+        let paths = self.selected_paths();
+        if !paths.is_empty() {
+            let r = shell::clipboard_text(Some(self.hwnd), &crate::tools::path_text(&paths));
+            self.report("Copy as path", r);
+        }
+    }
+
+    fn show_properties(&mut self) {
+        let mut paths = self.selected_paths();
+        if paths.is_empty() {
+            paths.push(self.current_dir().to_path_buf());
+        }
+        crate::tools::properties(&paths);
+    }
+
+    fn copy_or_move_to(&mut self, mv: bool) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            return;
+        }
+        let title = if mv { "Move items to" } else { "Copy items to" };
+        if let Some(dest) = crate::tools::pick_folder(self.hwnd, title, self.current_dir()) {
+            self.start_transfer(if mv { Op::Move } else { Op::Copy }, paths, Some(dest));
+        }
+    }
+
+    /// Opens a second window on the current folder (Ctrl+N).
+    fn new_window(&self) {
+        if let Ok(exe) = std::env::current_exe() {
+            let _ = std::process::Command::new(exe).arg(self.current_dir()).spawn();
+        }
+    }
+
+    fn create_text_file(&mut self) {
+        if self.searching {
+            return;
+        }
+        match crate::tools::new_text_file(self.current_dir()) {
+            Ok(p) => {
+                if !self.columns_view() {
+                    self.pending_rename = p.file_name().map(|n| n.to_os_string());
+                }
+                self.reload_current();
+            }
+            Err(e) => {
+                self.error = Some(format!("New text document failed: {e}"));
+                self.invalidate();
+            }
+        }
+    }
+
     fn create_folder(&mut self) {
         if self.searching {
             return;
@@ -1742,6 +1794,18 @@ impl App {
         const HIDDEN: usize = 9;
         const PATHBAR: usize = 10;
         const SETTINGS: usize = 11;
+        const OPEN_WITH: usize = 12;
+        const COPY_PATH: usize = 13;
+        const COPY_TO: usize = 14;
+        const MOVE_TO: usize = 15;
+        const PROPERTIES: usize = 16;
+        const MORE: usize = 17;
+        const NEW_TEXT: usize = 18;
+        const SELECT_ALL: usize = 19;
+        const SELECT_NONE: usize = 20;
+        const INVERT: usize = 21;
+        const TERMINAL: usize = 22;
+        let one_file = self.selected_paths().len() == 1 && self.selected_paths()[0].is_file();
         let can_paste = shell::clipboard_get(Some(self.hwnd)).is_some();
         let cmd = unsafe {
             let Ok(m) = CreatePopupMenu() else { return };
@@ -1750,6 +1814,7 @@ impl App {
             };
             if on_item {
                 add(OPEN, w!("Open"), MF_ENABLED);
+                add(OPEN_WITH, w!("Open with…"), if one_file { MF_ENABLED } else { MF_GRAYED });
                 if self.searching {
                     add(SHOW, w!("Show in Folder"), MF_ENABLED);
                 }
@@ -1757,20 +1822,38 @@ impl App {
                 add(RENAME, w!("Rename\tF2"), if self.columns_view() { MF_GRAYED } else { MF_ENABLED });
                 add(COPY, w!("Copy\tCtrl+C"), MF_ENABLED);
                 add(CUT, w!("Cut\tCtrl+X"), MF_ENABLED);
+                add(COPY_PATH, w!("Copy as path\tCtrl+Shift+C"), MF_ENABLED);
+                add(COPY_TO, w!("Copy to…"), MF_ENABLED);
+                add(MOVE_TO, w!("Move to…"), MF_ENABLED);
                 add(DELETE, w!("Delete\tDel"), MF_ENABLED);
                 let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
                 if let Some(sub) = self.tag_menu() {
                     let _ = AppendMenuW(m, MF_POPUP, sub.0 as usize, w!("Tags"));
                 }
+                let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+                add(PROPERTIES, w!("Properties\tAlt+Enter"), MF_ENABLED);
+                add(MORE, w!("Show more options"), MF_ENABLED);
             } else {
                 self.view_sort_group_menus(m);
                 let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
                 add(PASTE, w!("Paste\tCtrl+V"), if can_paste && !self.searching { MF_ENABLED } else { MF_GRAYED });
-                add(NEW_FOLDER, w!("New Folder\tCtrl+Shift+N"), if self.searching { MF_GRAYED } else { MF_ENABLED });
+                if let Ok(new) = CreatePopupMenu() {
+                    let state = if self.searching { MF_GRAYED } else { MF_ENABLED };
+                    let _ = AppendMenuW(new, MF_STRING | state, NEW_FOLDER, w!("Folder\tCtrl+Shift+N"));
+                    let _ = AppendMenuW(new, MF_STRING | state, NEW_TEXT, w!("Text Document"));
+                    let _ = AppendMenuW(m, MF_POPUP, new.0 as usize, w!("New"));
+                }
                 let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+                let cols = if self.columns_view() { MF_GRAYED } else { MF_ENABLED };
+                add(SELECT_ALL, w!("Select all\tCtrl+A"), cols);
+                add(SELECT_NONE, w!("Select none"), cols);
+                add(INVERT, w!("Invert selection"), cols);
+                let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+                add(TERMINAL, w!("Open in Terminal"), if self.searching { MF_GRAYED } else { MF_ENABLED });
                 add(HIDDEN, w!("Show Hidden Files"), if self.settings.show_hidden { MF_CHECKED } else { MF_UNCHECKED });
                 add(PATHBAR, w!("Show Path Bar\tCtrl+Alt+P"), if self.show_pathbar { MF_CHECKED } else { MF_UNCHECKED });
                 let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+                add(PROPERTIES, w!("Properties\tAlt+Enter"), MF_ENABLED);
                 add(SETTINGS, w!("Settings…\tCtrl+,"), MF_ENABLED);
             }
             let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, None, self.hwnd, None);
@@ -1809,6 +1892,37 @@ impl App {
             }
             PATHBAR => self.toggle_pathbar(),
             SETTINGS => self.open_settings(),
+            OPEN_WITH => {
+                if let Some(p) = self.selected_paths().first() {
+                    crate::tools::open_with(self.hwnd, p);
+                }
+            }
+            COPY_PATH => self.copy_as_path(),
+            COPY_TO | MOVE_TO => self.copy_or_move_to(cmd == MOVE_TO),
+            PROPERTIES if on_item => self.show_properties(),
+            PROPERTIES => crate::tools::properties(&[self.current_dir().to_path_buf()]),
+            MORE => {
+                let paths = self.selected_paths();
+                // The Windows menu needs items from one folder.
+                let first = paths.first().and_then(|p| p.parent().map(Path::to_path_buf));
+                let same: Vec<PathBuf> = paths.into_iter().filter(|p| p.parent().map(Path::to_path_buf) == first).collect();
+                crate::tools::shell_menu(self.hwnd, &same, screen);
+                self.reload_current();
+            }
+            NEW_TEXT => self.create_text_file(),
+            SELECT_ALL => {
+                self.list.sel.select_all(self.list.entries.len());
+                self.invalidate();
+            }
+            SELECT_NONE => {
+                self.list.sel.clear();
+                self.invalidate();
+            }
+            INVERT => {
+                self.list.sel.invert(self.list.entries.len());
+                self.invalidate();
+            }
+            TERMINAL => crate::tools::open_terminal(self.hwnd, self.current_dir()),
             c => {
                 if !self.apply_view_cmd(c) {
                     self.apply_tag_cmd(c);
@@ -2020,7 +2134,12 @@ impl App {
             0x4C if mods().ctrl => self.show_address(), // Ctrl+L
             0x46 if mods().ctrl => self.focus_search(), // Ctrl+F
             0x50 if mods().ctrl && key_down(VK_MENU.0) => self.toggle_pathbar(), // Ctrl+Alt+P
+            0x43 if mods().ctrl && mods().shift => self.copy_as_path(), // Ctrl+Shift+C
             0x43 if mods().ctrl => self.copy_selection(false), // Ctrl+C
+            0x4E if mods().ctrl && !mods().shift => self.new_window(), // Ctrl+N
+            0x57 if mods().ctrl => unsafe {
+                let _ = PostMessageW(Some(self.hwnd), WM_CLOSE, WPARAM(0), LPARAM(0)); // Ctrl+W
+            },
             0x58 if mods().ctrl => self.copy_selection(true),  // Ctrl+X
             0x56 if mods().ctrl => self.paste_here(),           // Ctrl+V
             0x4E if mods().ctrl && mods().shift => self.create_folder(), // Ctrl+Shift+N
@@ -2097,6 +2216,7 @@ impl App {
             v if v == VK_LEFT.0 => self.go_back(),
             v if v == VK_RIGHT.0 => self.go_forward(),
             v if v == VK_UP.0 => self.go_up(),
+            v if v == VK_RETURN.0 => self.show_properties(), // Alt+Enter
             _ => return false,
         }
         true
@@ -2104,6 +2224,9 @@ impl App {
 
     fn handle(&mut self, msg: u32, wp: WPARAM, lp: LPARAM) -> Option<LRESULT> {
         let hwnd = self.hwnd;
+        if let Some(r) = crate::tools::forward_menu_msg(msg, wp, lp) {
+            return Some(r);
+        }
         match msg {
             WM_PAINT => {
                 self.paint();

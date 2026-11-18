@@ -17,6 +17,7 @@ mod settings;
 mod shell;
 mod theme;
 mod tags;
+mod tools;
 mod thumbs;
 mod transfer;
 mod views;

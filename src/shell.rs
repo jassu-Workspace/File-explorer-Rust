@@ -307,6 +307,19 @@ fn global_bytes(bytes: &[u8]) -> windows::core::Result<HGLOBAL> {
     }
 }
 
+/// Puts plain text on the clipboard (Copy as path).
+pub fn clipboard_text(hwnd: Option<HWND>, text: &str) -> windows::core::Result<()> {
+    let mut bytes: Vec<u8> = text.encode_utf16().chain(Some(0)).flat_map(u16::to_le_bytes).collect();
+    bytes.shrink_to_fit();
+    let h = global_bytes(&bytes)?;
+    let _cb = Clipboard::open(hwnd)?;
+    unsafe {
+        EmptyClipboard()?;
+        SetClipboardData(13 /* CF_UNICODETEXT */, Some(HANDLE(h.0)))?;
+    }
+    Ok(())
+}
+
 /// Puts files on the clipboard the way Explorer does (CF_HDROP + Preferred DropEffect).
 pub fn clipboard_put(hwnd: Option<HWND>, paths: &[PathBuf], cut: bool) -> windows::core::Result<()> {
     let header = DROPFILES { pFiles: size_of::<DROPFILES>() as u32, pt: POINT::default(), fNC: false.into(), fWide: true.into() };
