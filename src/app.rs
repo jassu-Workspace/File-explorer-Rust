@@ -802,12 +802,15 @@ impl App {
         if !self.searching || !self.search_gen.is_current(generation) {
             return;
         }
+        // New rows reorder the list; keep the user's selection on the same files (a Delete must hit what they chose).
+        let keep = self.list.selection_keys();
         self.list.entries.append(&mut batch);
         // Keep results sorted while the list is small; past that, sort once when the walk ends.
         if self.list.entries.len() < 50_000 {
             self.list.resort();
         }
         self.regroup();
+        self.list.restore_selection(&keep);
         self.invalidate();
     }
 
@@ -817,10 +820,12 @@ impl App {
         }
         self.search_running = false;
         self.search_skipped = stats.skipped_denied;
+        let keep = self.list.selection_keys();
         if self.list.entries.len() >= 50_000 {
             self.list.resort();
         }
         self.regroup();
+        self.list.restore_selection(&keep);
         self.invalidate();
     }
 

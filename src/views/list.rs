@@ -71,6 +71,11 @@ pub enum ListAction {
     Redraw,
 }
 
+/// A row's identity: its folder relative to the listing (search results) and its name.
+pub type RowKey = (Option<std::path::PathBuf>, std::ffi::OsString);
+/// Selected rows and the focused row, by identity.
+pub type SelectionKeys = (Vec<RowKey>, Option<RowKey>);
+
 #[derive(Debug)]
 pub struct ListView {
     pub entries: Vec<Entry>,
@@ -103,6 +108,21 @@ impl ListView {
         self.sel.clear();
         self.scroll_y = 0.0;
         self.hover_row = None;
+    }
+
+    /// Identity of the selected rows (folder relative to the listing + name), and of the focused row.
+    pub fn selection_keys(&self) -> SelectionKeys {
+        let key = |i: usize| self.entries.get(i).map(|e| (e.rel_dir.clone(), e.name.clone()));
+        (self.sel.selected().into_iter().filter_map(key).collect(), self.sel.focus().and_then(key))
+    }
+
+    /// Re-selects the same files after the rows were reordered (selection is stored by row index).
+    pub fn restore_selection(&mut self, keys: &SelectionKeys) {
+        let find = |k: &RowKey| self.entries.iter().position(|e| e.rel_dir == k.0 && e.name == k.1);
+        let idx: Vec<usize> = keys.0.iter().filter_map(find).collect();
+        let focus = keys.1.as_ref().and_then(find);
+        self.sel.set(idx);
+        self.sel.set_focus(focus);
     }
 
     pub fn resort(&mut self) {
@@ -348,6 +368,21 @@ mod tests {
         l.on_char('0', t + Duration::from_millis(100));
         l.on_char('5', t + Duration::from_millis(200));
         assert_eq!(l.sel.focus(), Some(50));
+    }
+
+    #[test]
+    fn reorder_keeps_the_same_files_selected() {
+        let mut l = lv();
+        l.click_row(5, NONE);
+        l.click_row(7, Mods { ctrl: true, shift: false });
+        let keep = l.selection_keys();
+        l.sort = (SortKey::Size, true);
+        l.resort();
+        l.restore_selection(&keep);
+        let mut names: Vec<String> = l.sel.selected().iter().map(|&i| l.entries[i].name.to_string_lossy().into_owned()).collect();
+        names.sort();
+        assert_eq!(names, ["f005", "f007"]);
+        assert_eq!(l.entries[l.sel.focus().unwrap()].name, "f007", "focus follows its file too");
     }
 
     #[test]

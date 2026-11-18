@@ -50,6 +50,11 @@ impl Selection {
         idx.dedup();
         self.sel = idx;
     }
+    /// Moves focus (and the Shift anchor) to `i`, e.g. after rows were reordered.
+    pub fn set_focus(&mut self, i: Option<usize>) {
+        self.focus = i;
+        self.anchor = i;
+    }
     pub fn select_all(&mut self, count: usize) {
         self.sel = (0..count).collect();
     }
