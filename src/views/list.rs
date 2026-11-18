@@ -260,8 +260,12 @@ pub fn paint(app: &mut App) {
                             app.gfx.bitmap(&b, icon);
                         }
                     }
-                    let name = shell::display_name(e);
+                    let name = shell::display_name(e, app.settings.show_ext);
                     app.gfx.text(&name, Rect::new(cell.x + 24.0, y, cell.w - 24.0, ROW_H), &app.gfx.fonts.body, fg);
+                    if app.settings.click == crate::settings::ClickMode::Single && app.list.hover_row == Some(i) && !selected {
+                        let w = app.gfx.measure(&name, &app.gfx.fonts.body).min(cell.w - 24.0);
+                        app.gfx.line(cell.x + 24.0, y + ROW_H - 5.5, cell.x + 24.0 + w, y + ROW_H - 5.5, t.accent);
+                    }
                     let tags = app.tags.of(&app.entry_path(e));
                     let after = cell.x + 24.0 + app.gfx.measure(&name, &app.gfx.fonts.body).min(cell.w - 60.0) + 6.0;
                     crate::views::grid::paint_tag_dots(app, &tags, after, y + ROW_H / 2.0);

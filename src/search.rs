@@ -63,7 +63,7 @@ struct Queue {
 struct Shared {
     root: PathBuf,
     query: String,
-    show_hidden: bool,
+    keep: Box<dyn Fn(u32) -> bool + Send + Sync>,
     queue: Mutex<Queue>,
     cv: Condvar,
     pending: Mutex<(Vec<Entry>, Instant)>,
@@ -77,7 +77,7 @@ struct Shared {
 pub fn start_search(
     root: PathBuf,
     query: &str,
-    show_hidden: bool,
+    keep: impl Fn(u32) -> bool + Send + Sync + 'static,
     on_batch: impl Fn(Vec<Entry>) + Send + Sync + 'static,
     on_done: impl FnOnce(SearchStats) + Send + 'static,
 ) -> SearchHandle {
@@ -87,7 +87,7 @@ pub fn start_search(
         queue: Mutex::new(Queue { dirs: vec![root.clone()], busy: 0 }),
         root,
         query: query.to_lowercase(),
-        show_hidden,
+        keep: Box::new(keep),
         cv: Condvar::new(),
         pending: Mutex::new((Vec::new(), Instant::now())),
         cancel: cancel.clone(),
@@ -151,7 +151,7 @@ fn scan(s: &Shared, dir: &PathBuf) {
             return;
         }
         let Ok(mut e) = de.and_then(|de| entry_from(&de)) else { continue };
-        if !s.show_hidden && e.is_hidden() {
+        if !(s.keep)(e.attrs) {
             continue;
         }
         if e.is_dir() && !e.is_reparse() {
@@ -208,7 +208,7 @@ mod tests {
         let got = Arc::new(Mutex::new(Vec::new()));
         let g = got.clone();
         let (tx, rx) = mpsc::channel();
-        let _h = start_search(root.to_path_buf(), q, hidden, move |b| g.lock().unwrap().extend(b), move |s| tx.send(s).unwrap());
+        let _h = start_search(root.to_path_buf(), q, move |a| hidden || a & 0x6 == 0, move |b| g.lock().unwrap().extend(b), move |s| tx.send(s).unwrap());
         let stats = rx.recv_timeout(Duration::from_secs(10)).expect("search finished");
         let v = std::mem::take(&mut *got.lock().unwrap());
         (v, stats)
@@ -310,7 +310,7 @@ mod tests {
         let (dn, lt) = (done.clone(), late.clone());
         let d2 = done.clone();
         let (tx, rx) = mpsc::channel();
-        let h = start_search(d.clone(), "f", true, move |_| if *dn.lock().unwrap() { *lt.lock().unwrap() = true }, move |s| {
+        let h = start_search(d.clone(), "f", |_| true, move |_| if *dn.lock().unwrap() { *lt.lock().unwrap() = true }, move |s| {
             *d2.lock().unwrap() = true;
             tx.send(s).unwrap();
         });

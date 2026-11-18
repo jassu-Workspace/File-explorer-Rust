@@ -3,6 +3,7 @@ pub mod gallery;
 pub mod grid;
 pub mod list;
 pub mod pathbar;
+pub mod settings;
 pub mod sidebar;
 pub mod toolbar;
 
@@ -35,13 +36,13 @@ pub fn paint(app: &mut App) {
         }
         crate::app::View::List => list::paint(app),
     }
-    {
+    if app.show_pathbar {
         let (g, t, l) = (&app.gfx, &app.theme, &app.layout);
-        if !app.show_pathbar {
-            return;
-        }
         g.fill_rect(l.pathbar, t.window_bg);
         g.line(0.0, l.pathbar.y + 0.5, l.pathbar.w, l.pathbar.y + 0.5, t.separator);
+        pathbar::paint(app);
     }
-    pathbar::paint(app);
+    if app.settings_open {
+        settings::paint(app);
+    }
 }

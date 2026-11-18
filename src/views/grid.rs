@@ -233,7 +233,7 @@ pub fn paint(app: &mut App) {
                 }
             }
         }
-        let name = shell::display_name(&app.list.entries[i]);
+        let name = shell::display_name(&app.list.entries[i], app.settings.show_ext);
         let text = Rect::new(cell.x + 4.0, icon.bottom() + 8.0, cell.w - 8.0, NAME_H);
         let tags = app.tags.of(&app.entry_path(&app.list.entries[i]));
         if !tags.is_empty() {
@@ -250,6 +250,11 @@ pub fn paint(app: &mut App) {
             t.text
         };
         app.gfx.text(&name, text, &app.gfx.fonts.cell, fg);
+        if app.settings.click == crate::settings::ClickMode::Single && app.list.hover_row == Some(i) && !selected {
+            let (w, _) = app.gfx.measure_box(&name, &app.gfx.fonts.cell, text.w, 16.0);
+            let x = text.x + (text.w - w) / 2.0;
+            app.gfx.line(x, text.y + 15.5, x + w, text.y + 15.5, t.accent);
+        }
     }
     if let Some(b) = app.band_rect() {
         let r = Rect::new(content.x + b.x, content.y + b.y - scroll, b.w, b.h);

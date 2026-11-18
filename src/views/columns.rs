@@ -77,7 +77,7 @@ pub fn paint(app: &mut App) {
                     app.gfx.bitmap(&b, icon);
                 }
             }
-            let name = shell::display_name(e);
+            let name = shell::display_name(e, app.settings.show_ext);
             app.gfx.text(&name, Rect::new(r.x + 34.0, y, r.w - 60.0, ROW_H), &app.gfx.fonts.body, fg);
         }
         app.columns.cols[i].entries = Some(entries);
@@ -106,7 +106,7 @@ pub fn paint_info_at(app: &mut App, e: &Entry, x: f32, top: f32) {
             app.gfx.bitmap(&b, icon);
         }
     }
-    let name = shell::display_name(e);
+    let name = shell::display_name(e, app.settings.show_ext);
     app.gfx.text(&name, Rect::new(x + 16.0, top + 108.0, INFO_W - 32.0, 24.0), &app.gfx.fonts.big, t.text);
     let kind = shell::type_name(e, &mut app.type_names);
     let modified = format_modified(shell::to_local(e.modified), shell::now_local());

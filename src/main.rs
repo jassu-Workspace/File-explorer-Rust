@@ -11,6 +11,7 @@ mod prefs;
 mod search;
 mod selection;
 mod share;
+mod settings;
 mod shell;
 mod theme;
 mod tags;

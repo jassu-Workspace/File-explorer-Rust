@@ -44,6 +44,7 @@ pub const WM_THUMB_DONE: u32 = WM_APP + 5;
 const ID_SEARCH_TIMER: usize = 1;
 const SEARCH_DEBOUNCE_MS: u32 = 150;
 const ID_ANIM_TIMER: usize = 2;
+const ID_HOVER_SELECT: usize = 3;
 /// Menu ids 100..107 are the seven color tags.
 const TAG_CMD: usize = 100;
 const SCROLL_ANIM: Duration = Duration::from_millis(120);
@@ -51,6 +52,13 @@ const HOVER_ANIM: Duration = Duration::from_millis(100);
 const COLUMN_ANIM: Duration = Duration::from_millis(150);
 
 /// Finder's "Group" button.
+/// What a mouse press landed on, for single-click open.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum PressTarget {
+    Item(usize),
+    Column(usize, usize),
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum GroupBy {
     None,
@@ -151,7 +159,14 @@ pub struct App {
     pub columns: Columns,
     pub error: Option<String>,
     pub loading: bool,
-    pub show_hidden: bool,
+    pub settings: crate::settings::Settings,
+    win_defaults: crate::settings::WinDefaults,
+    pub settings_open: bool,
+    sheet_anim: Option<crate::layout::Anim>,
+    /// Press on an item, for single-click open on release: (x, y, target, Ctrl/Shift held).
+    press: Option<(f32, f32, PressTarget, bool)>,
+    /// Item waiting for the hover-select timer (single-click mode).
+    hover_pending: Option<usize>,
     pub type_names: HashMap<String, String>,
     pub icon_idx: HashMap<String, i32>,
     pub sidebar: Sidebar,
@@ -273,9 +288,9 @@ impl App {
     }
 
     fn load_column(&self, path: PathBuf) {
-        let (hwnd, show_hidden) = (self.send_hwnd(), self.show_hidden);
+        let (hwnd, settings) = (self.send_hwnd(), self.settings);
         std::thread::spawn(move || {
-            let result = read_folder(&path, show_hidden);
+            let result = read_folder(&path, |a| settings.visible(a));
             hwnd.post(WM_COLUMN_DONE, Box::new((path, result)));
         });
     }
@@ -339,10 +354,13 @@ impl App {
                 self.columns.drop_offscreen(self.layout.content.w, crate::theme::COLUMN_W);
             }
         }
+        if self.sheet_anim.is_some_and(|a| a.done(now)) {
+            self.sheet_anim = None;
+        }
         if self.hover_anim.is_some_and(|a| a.done(now)) {
             self.hover_anim = None;
         }
-        if self.scroll_anim.is_none() && self.cols_anim.is_none() && self.hover_anim.is_none() {
+        if self.scroll_anim.is_none() && self.cols_anim.is_none() && self.hover_anim.is_none() && self.sheet_anim.is_none() {
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), ID_ANIM_TIMER);
             }
@@ -508,6 +526,89 @@ impl App {
             "columns" => Some(View::Columns),
             "gallery" => Some(View::Gallery),
             _ => None,
+        }
+    }
+
+    /// Changes (or with `None`, clears) a Files-only setting, saves it, and applies it.
+    pub fn change_setting(&mut self, key: crate::settings::Key, value: Option<&str>) {
+        crate::settings::set_override(&mut self.prefs, key, value);
+        let r = self.prefs.save().map_err(windows::core::Error::from);
+        self.report("Saving settings", r);
+        self.apply_settings();
+    }
+
+    /// Re-resolves settings (after a change here or in Windows) and reloads when visibility changed.
+    fn apply_settings(&mut self) {
+        let old = self.settings;
+        self.settings = crate::settings::Settings::resolve(self.win_defaults, &self.prefs);
+        if (old.show_hidden, old.show_system) != (self.settings.show_hidden, self.settings.show_system) {
+            self.reload_current();
+        }
+        self.invalidate();
+    }
+
+    pub fn windows_defaults(&self) -> crate::settings::WinDefaults {
+        self.win_defaults
+    }
+
+    pub fn sheet_progress(&self) -> f32 {
+        self.sheet_anim.map_or(1.0, |a| a.value(Instant::now()))
+    }
+
+    fn open_settings(&mut self) {
+        self.settings_open = true;
+        if self.animations {
+            self.sheet_anim = Some(crate::layout::Anim::new(0.0, 1.0, Duration::from_millis(220), Instant::now()));
+            self.start_anim_timer();
+        }
+        self.invalidate();
+    }
+
+    fn on_sheet(&mut self, a: views::settings::Action) {
+        use crate::settings::{ClickMode, Key, PanelStyle};
+        use views::settings::Action;
+        let flip = |on: bool| Some(if on { "0" } else { "1" });
+        match a {
+            Action::Click(m) => self.change_setting(Key::Click, Some(if m == ClickMode::Single { "single" } else { "double" })),
+            Action::Ext => self.change_setting(Key::Ext, flip(self.settings.show_ext)),
+            Action::Hidden => self.change_setting(Key::Hidden, flip(self.settings.show_hidden)),
+            Action::System => self.change_setting(Key::System, flip(self.settings.show_system)),
+            Action::PathBar => self.toggle_pathbar(),
+            Action::Panel(p) => {
+                let v = match p {
+                    PanelStyle::Pill => "pill",
+                    PanelStyle::Card => "card",
+                    PanelStyle::Stack => "stack",
+                };
+                self.change_setting(Key::Panel, Some(v));
+            }
+            Action::UseWindows => {
+                crate::settings::reset_to_windows(&mut self.prefs);
+                let _ = self.prefs.save();
+                self.apply_settings();
+            }
+            Action::Done => self.settings_open = false,
+        }
+        self.invalidate();
+    }
+
+    /// Opens the item a single click landed on (single-click mode), unless the press turned into a drag.
+    fn on_click_release(&mut self, x: f32, y: f32) {
+        let Some((px, py, target, mods_held)) = self.press.take() else { return };
+        let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) } as f32 / self.scale;
+        if !crate::settings::click_opens(self.settings.click, ((x - px).powi(2) + (y - py).powi(2)).sqrt(), threshold, mods_held) {
+            return;
+        }
+        match target {
+            PressTarget::Item(i) if self.item_at(x, y) == Some(Some(i)) => self.open_index(i),
+            PressTarget::Column(c, r) if views::columns::hit(self, x, y) == Some((c, Some(r))) => {
+                let col = &self.columns.cols[c];
+                if let Some(e) = col.entries.as_ref().and_then(|v| v.get(r)).filter(|e| !e.is_dir()) {
+                    let path = col.path.join(&e.name);
+                    self.open_path(&path);
+                }
+            }
+            _ => {}
         }
     }
 
@@ -791,7 +892,7 @@ impl App {
         self.search = Some(search::start_search(
             self.search_root.clone(),
             &query,
-            self.show_hidden,
+            { let s = self.settings; move |a| s.visible(a) },
             move |batch| h1.post(WM_SEARCH_BATCH, Box::new((generation, batch))),
             move |stats| h2.post(WM_SEARCH_DONE, Box::new((generation, stats))),
         ));
@@ -970,7 +1071,7 @@ impl App {
             self.view = self.pre_search_view;
         }
         let generation = self.listing_gen.next();
-        let (hwnd, show_hidden) = (self.send_hwnd(), self.show_hidden);
+        let (hwnd, settings) = (self.send_hwnd(), self.settings);
         self.loading = true;
         if let Some(t) = &self.thumbnailer {
             t.new_generation();
@@ -978,7 +1079,7 @@ impl App {
         self.thumb_pending.clear();
         self.thumb_exts.reset();
         std::thread::spawn(move || {
-            let result = read_folder(&path, show_hidden);
+            let result = read_folder(&path, |a| settings.visible(a));
             // Off the UI thread: GetDiskFreeSpaceEx can stall on network shares.
             let free = shell::free_space(&path);
             hwnd.post(WM_LISTING_DONE, Box::new(ListingMsg { generation, path, kind, result, free }));
@@ -1289,6 +1390,7 @@ impl App {
         const NEW_FOLDER: usize = 8;
         const HIDDEN: usize = 9;
         const PATHBAR: usize = 10;
+        const SETTINGS: usize = 11;
         let can_paste = shell::clipboard_get(Some(self.hwnd)).is_some();
         let cmd = unsafe {
             let Ok(m) = CreatePopupMenu() else { return };
@@ -1313,8 +1415,10 @@ impl App {
                 add(PASTE, w!("Paste\tCtrl+V"), if can_paste && !self.searching { MF_ENABLED } else { MF_GRAYED });
                 add(NEW_FOLDER, w!("New Folder\tCtrl+Shift+N"), if self.searching { MF_GRAYED } else { MF_ENABLED });
                 let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-                add(HIDDEN, w!("Show Hidden Files"), if self.show_hidden { MF_CHECKED } else { MF_UNCHECKED });
+                add(HIDDEN, w!("Show Hidden Files"), if self.settings.show_hidden { MF_CHECKED } else { MF_UNCHECKED });
                 add(PATHBAR, w!("Show Path Bar\tCtrl+Alt+P"), if self.show_pathbar { MF_CHECKED } else { MF_UNCHECKED });
+                let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+                add(SETTINGS, w!("Settings…\tCtrl+,"), MF_ENABLED);
             }
             let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, None, self.hwnd, None);
             let _ = DestroyMenu(m);
@@ -1346,10 +1450,12 @@ impl App {
             PASTE => self.paste_here(),
             NEW_FOLDER => self.create_folder(),
             HIDDEN => {
-                self.show_hidden = !self.show_hidden;
+                let v = if self.settings.show_hidden { "0" } else { "1" };
+                self.change_setting(crate::settings::Key::Hidden, Some(v));
                 self.reload_current();
             }
             PATHBAR => self.toggle_pathbar(),
+            SETTINGS => self.open_settings(),
             c => {
                 self.apply_tag_cmd(c);
             }
@@ -1450,6 +1556,18 @@ impl App {
     }
 
     fn on_left_down(&mut self, x: f32, y: f32) {
+        if self.settings_open {
+            let window = crate::layout::Rect::new(0.0, 0.0, self.w, self.h);
+            match views::settings::sheet_hit(window, x, y) {
+                Some(a) => self.on_sheet(a),
+                None if !views::settings::sheet_layout(window).0.contains(x, y) => {
+                    self.settings_open = false;
+                    self.invalidate();
+                }
+                None => {}
+            }
+            return;
+        }
         let l = self.layout;
         let r = self.toolbar();
         let tool = r.hit(x, y);
@@ -1472,7 +1590,10 @@ impl App {
         } else if self.columns_view() {
             if let Some((col, row)) = views::columns::hit(self, x, y) {
                 match row {
-                    Some(row) => self.column_select(col, row),
+                    Some(row) => {
+                        self.column_select(col, row);
+                        self.press = Some((x, y, PressTarget::Column(col, row), false));
+                    }
                     None => {
                         self.columns.focus_col = col;
                         self.invalidate();
@@ -1498,7 +1619,11 @@ impl App {
             self.invalidate();
         } else if let Some(hit) = self.item_at(x, y) {
             match hit {
-                Some(i) => self.list.click_row(i, mods()),
+                Some(i) => {
+                    let m = mods();
+                    self.list.click_row(i, m);
+                    self.press = Some((x, y, PressTarget::Item(i), m.ctrl || m.shift));
+                }
                 None => self.list.sel.clear(),
             }
             self.invalidate();
@@ -1543,6 +1668,11 @@ impl App {
             0x4E if mods().ctrl && mods().shift => self.create_folder(), // Ctrl+Shift+N
             v if v == VK_F2.0 => self.start_rename(),
             v if v == VK_DELETE.0 => self.delete_selection(mods().shift),
+            v if v == VK_ESCAPE.0 && self.settings_open => {
+                self.settings_open = false;
+                self.invalidate();
+            }
+            0xBC if mods().ctrl => self.open_settings(), // Ctrl+,
             v if v == VK_ESCAPE.0 && self.searching => {
                 self.clear_search_field();
                 self.end_search(true);
@@ -1620,6 +1750,16 @@ impl App {
             }
             WM_CONTEXTMENU => {
                 self.on_context_menu(lp);
+                Some(LRESULT(0))
+            }
+            WM_TIMER if wp.0 == ID_HOVER_SELECT => {
+                unsafe {
+                    let _ = KillTimer(Some(hwnd), ID_HOVER_SELECT);
+                }
+                if let Some(i) = self.hover_pending.take().filter(|&i| self.list.hover_row == Some(i) && !self.settings_open) {
+                    self.list.sel.click(i);
+                    self.invalidate();
+                }
                 Some(LRESULT(0))
             }
             WM_TIMER if wp.0 == ID_ANIM_TIMER => {
@@ -1769,6 +1909,16 @@ impl App {
                 self.track_leave(false);
                 self.set_hot(self.hot_at(x, y));
                 let hover = self.item_at(x, y).flatten();
+                if self.settings.click == crate::settings::ClickMode::Single && hover != self.list.hover_row {
+                    self.hover_pending = hover;
+                    if hover.is_some() && self.press.is_none() {
+                        let mut ms = 400u32;
+                        unsafe {
+                            let _ = SystemParametersInfoW(SPI_GETMOUSEHOVERTIME, 0, Some(&mut ms as *mut u32 as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0));
+                            SetTimer(Some(hwnd), ID_HOVER_SELECT, ms, None);
+                        }
+                    }
+                }
                 let side = self.sidebar.hit(x, y, self.layout.sidebar);
                 let header = self.sidebar.header_at(x, y, self.layout.sidebar);
                 if header != self.sidebar.hover_header {
@@ -1796,7 +1946,13 @@ impl App {
             }
             WM_LBUTTONDBLCLK => {
                 let (x, y) = self.client_dip(lp);
-                if self.columns_view() && self.layout.content.contains(x, y) {
+                let on_item = self.item_at(x, y).flatten().is_some() || (self.columns_view() && self.layout.content.contains(x, y));
+                if self.settings.click == crate::settings::ClickMode::Single && on_item && !self.settings_open {
+                    return Some(LRESULT(0)); // the first click already opened it
+                }
+                if self.settings_open {
+                    self.on_left_down(x, y);
+                } else if self.columns_view() && self.layout.content.contains(x, y) {
                     // Folders already opened on the first click; a double-click opens files.
                     if let Some((col, Some(row))) = views::columns::hit(self, x, y) {
                         let c = &self.columns.cols[col];
@@ -1815,6 +1971,11 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
+                let (ux, uy) = self.client_dip(lp);
+                if self.band.is_none() && !self.dragging_splitter {
+                    self.on_click_release(ux, uy);
+                }
+                self.press = None;
                 if self.band.take().is_some() {
                     unsafe {
                         let _ = ReleaseCapture();
@@ -1891,6 +2052,11 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_SETTINGCHANGE => {
+                let fresh = crate::settings::read_windows();
+                if fresh != self.win_defaults {
+                    self.win_defaults = fresh;
+                    self.apply_settings();
+                }
                 let is_color = lp.0 != 0 && unsafe { PCWSTR(lp.0 as *const u16).to_string() }.is_ok_and(|s| s == "ImmersiveColorSet");
                 if is_color {
                     self.theme = Theme::system();
@@ -2049,7 +2215,12 @@ pub fn run() -> Result<()> {
             columns: Columns::default(),
             error: None,
             loading: false,
-            show_hidden: false,
+            settings: crate::settings::Settings::resolve(crate::settings::read_windows(), &crate::prefs::Prefs::new(1)),
+            win_defaults: crate::settings::read_windows(),
+            settings_open: false,
+            sheet_anim: None,
+            press: None,
+            hover_pending: None,
             type_names: HashMap::new(),
             icon_idx: HashMap::new(),
             sidebar: Sidebar::load(),
@@ -2080,6 +2251,7 @@ pub fn run() -> Result<()> {
         });
         app.apply_theme_to_frame();
         app.show_pathbar = app.prefs.get("@pathbar") == Some("1");
+        app.settings = crate::settings::Settings::resolve(app.win_defaults, &app.prefs);
         app.rebuild_edit_style();
         app.pending_select = select;
         app.navigate(start, NavKind::Refresh);

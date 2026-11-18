@@ -70,13 +70,25 @@ pub fn cloud() -> Vec<Place> {
     places(&[("OneDrive", &FOLDERID_SkyDrive, Glyph::Cloud)])
 }
 
-/// Name shown to the user: shortcut extensions are hidden, like Explorer does.
-pub fn display_name(e: &Entry) -> String {
+/// Name shown to the user: shortcut extensions are always hidden (like Explorer); other extensions only when
+/// "show file name extensions" is off.
+pub fn display_name(e: &Entry, show_ext: bool) -> String {
     let name = e.name.to_string_lossy();
+    if e.is_dir() {
+        return name.into_owned();
+    }
     let lower = name.to_ascii_lowercase();
-    match [".lnk", ".url"].iter().find(|x| !e.is_dir() && lower.ends_with(*x)) {
+    let base = match [".lnk", ".url"].iter().find(|x| lower.ends_with(*x)) {
         Some(x) => name[..name.len() - x.len()].to_string(),
         None => name.into_owned(),
+    };
+    if show_ext {
+        return base;
+    }
+    // A leading dot is a name, not an extension (".gitignore" stays).
+    match base.rfind('.') {
+        Some(i) if i > 0 => base[..i].to_string(),
+        _ => base,
     }
 }
 
@@ -404,11 +416,15 @@ mod tests {
     #[test]
     fn display_name_hides_shortcut_extensions() {
         let e = |n: &str| Entry { name: n.into(), size: 0, modified: 0, attrs: 0x20, rel_dir: None };
-        assert_eq!(display_name(&e("Report.docx.lnk")), "Report.docx");
-        assert_eq!(display_name(&e("Site.URL")), "Site");
-        assert_eq!(display_name(&e("notes.txt")), "notes.txt");
+        assert_eq!(display_name(&e("Report.docx.lnk"), true), "Report.docx");
+        assert_eq!(display_name(&e("Site.URL"), true), "Site");
+        assert_eq!(display_name(&e("notes.txt"), true), "notes.txt");
+        assert_eq!(display_name(&e("notes.txt"), false), "notes");
+        assert_eq!(display_name(&e("Report.docx.lnk"), false), "Report");
+        assert_eq!(display_name(&e(".gitignore"), false), ".gitignore");
+        assert_eq!(display_name(&e("archive.tar.gz"), false), "archive.tar");
         let dir = Entry { attrs: 0x10, ..e("folder.lnk") };
-        assert_eq!(display_name(&dir), "folder.lnk", "folders keep their name");
+        assert_eq!(display_name(&dir, false), "folder.lnk", "folders keep their name");
     }
 
     #[test]

@@ -4,8 +4,6 @@ use std::io;
 use std::os::windows::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
-const ATTR_HIDDEN: u32 = 0x2;
-const ATTR_SYSTEM: u32 = 0x4;
 const ATTR_DIRECTORY: u32 = 0x10;
 const ATTR_REPARSE: u32 = 0x400;
 
@@ -24,9 +22,6 @@ impl Entry {
     pub fn is_dir(&self) -> bool {
         self.attrs & ATTR_DIRECTORY != 0
     }
-    pub fn is_hidden(&self) -> bool {
-        self.attrs & (ATTR_HIDDEN | ATTR_SYSTEM) != 0
-    }
     pub fn is_reparse(&self) -> bool {
         self.attrs & ATTR_REPARSE != 0
     }
@@ -44,11 +39,12 @@ pub fn entry_from(de: &std::fs::DirEntry) -> io::Result<Entry> {
     Ok(Entry { name: de.file_name(), size: m.file_size(), modified: m.last_write_time(), attrs: m.file_attributes(), rel_dir: None })
 }
 
-pub fn read_folder(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
+/// Lists `path`, keeping entries whose attributes pass `keep` (the Explorer visibility rules).
+pub fn read_folder(path: &Path, keep: impl Fn(u32) -> bool) -> io::Result<Vec<Entry>> {
     let mut out = Vec::new();
     for de in std::fs::read_dir(path)? {
         let Ok(e) = de.and_then(|de| entry_from(&de)) else { continue };
-        if show_hidden || !e.is_hidden() {
+        if keep(e.attrs) {
             out.push(e);
         }
     }
@@ -184,7 +180,7 @@ mod tests {
         let d = tmp("list");
         fs::write(d.join("a.txt"), b"hello").unwrap();
         fs::create_dir(d.join("sub")).unwrap();
-        let v = read_folder(&d, true).unwrap();
+        let v = read_folder(&d, |_| true).unwrap();
         assert_eq!(v.len(), 2);
         let a = v.iter().find(|e| e.name == "a.txt").unwrap();
         assert_eq!(a.size, 5);
@@ -199,20 +195,20 @@ mod tests {
         let f = d.join("secret.txt");
         fs::write(&f, b"x").unwrap();
         assert!(Command::new("attrib").arg("+h").arg(&f).status().unwrap().success());
-        assert!(read_folder(&d, false).unwrap().is_empty());
-        assert_eq!(read_folder(&d, true).unwrap().len(), 1);
+        assert!(read_folder(&d, |a| a & 0x2 == 0).unwrap().is_empty());
+        assert_eq!(read_folder(&d, |_| true).unwrap().len(), 1);
         let _ = Command::new("attrib").arg("-h").arg(&f).status();
         fs::remove_dir_all(d).unwrap();
     }
 
     #[test]
     fn read_folder_denied_returns_err() {
-        assert!(read_folder(Path::new(r"C:\System Volume Information"), true).is_err());
+        assert!(read_folder(Path::new(r"C:\System Volume Information"), |_| true).is_err());
     }
 
     #[test]
     fn read_folder_missing_returns_err() {
-        assert!(read_folder(Path::new(r"C:\definitely\not\here\fx"), true).is_err());
+        assert!(read_folder(Path::new(r"C:\definitely\not\here\fx"), |_| true).is_err());
     }
 
     #[test]
