@@ -20,6 +20,7 @@ mod tags;
 mod tools;
 mod thumbs;
 mod transfer;
+mod undo;
 mod views;
 
 use windows::Win32::System::Ole::OleInitialize;

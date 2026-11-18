@@ -39,6 +39,8 @@ pub struct Row {
     pub shake_at: Option<Instant>,
     /// When the "current file" last changed (photo stack flips).
     pub flipped_at: Option<Instant>,
+    /// False while replaying undo/redo, so the replay is not recorded again.
+    pub record: bool,
 }
 
 impl Row {

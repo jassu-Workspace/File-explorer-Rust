@@ -186,6 +186,9 @@ pub struct App {
     pub xfer: views::transfer::Transfers,
     /// Folder highlighted under a drag (drop target feedback).
     pub drop_hi: Option<crate::layout::Rect>,
+    undo: crate::undo::History,
+    /// Set while undo/redo starts its transfers.
+    undoing: bool,
     /// Press on an item, for single-click open on release: (x, y, target, Ctrl/Shift held).
     press: Option<(f32, f32, PressTarget, bool)>,
     /// Item waiting for the hover-select timer (single-click mode).
@@ -827,7 +830,7 @@ impl App {
             let c = g.cell(i);
             return crate::layout::Rect::new(a.x + c.x + 4.0, a.y + c.y - self.list.scroll_y + 16.0 + g.icon, c.w - 8.0, 20.0);
         }
-        let name_w = views::list::columns(a.w, self.list.show_where)[0].2;
+        let name_w = views::list::columns(a.w, self.list.show_where, &self.list.shown)[0].2;
         let y = a.y + self.list_grid().cell(i).y - self.list.scroll_y;
         crate::layout::Rect::new(a.x + 32.0, y, name_w - 40.0, crate::theme::ROW_H)
     }
@@ -1376,6 +1379,7 @@ impl App {
             dest,
             shake_at: None,
             flipped_at: None,
+            record: !self.undoing,
         });
         let send = self.send_hwnd();
         std::thread::spawn(move || crate::transfer::run(job, cancel, move |u| send.post(WM_TRANSFER, Box::new((id, u)))));
@@ -1433,7 +1437,9 @@ impl App {
 
     fn on_drag_query(&mut self, q: &mut crate::dragdrop::Query) {
         let target = q.at.and_then(|(px, py)| self.drop_dest_at(px as f32 / self.scale, py as f32 / self.scale));
-        let op = target.as_ref().and_then(|(dest, _)| crate::dragdrop::drop_op(&q.items, dest, q.ctrl, q.shift));
+        let op = target.as_ref().and_then(|(dest, _)| {
+            if shell::is_recycle_bin(dest) { (!q.items.is_empty()).then_some(Op::Recycle) } else { crate::dragdrop::drop_op(&q.items, dest, q.ctrl, q.shift) }
+        });
         let hi = target.as_ref().filter(|_| op.is_some() && !q.drop).map(|t| t.1);
         if hi != self.drop_hi {
             self.drop_hi = hi;
@@ -1443,7 +1449,8 @@ impl App {
         if q.drop
             && let (Some(op), Some((dest, _))) = (op, target)
         {
-            self.start_transfer(op, std::mem::take(&mut q.items), Some(dest));
+            let dest = (op != Op::Recycle).then_some(dest);
+            self.start_transfer(op, std::mem::take(&mut q.items), dest);
         }
     }
 
@@ -1493,8 +1500,8 @@ impl App {
             }
             Update::Done { cancelled } => {
                 row.done = Some((now, cancelled));
-                let (op, items, dest) = (row.op, row.items.clone(), row.dest.clone());
-                self.finish_transfer(op, &items, dest.as_deref(), cancelled);
+                let (op, items, dest, record) = (row.op, row.items.clone(), row.dest.clone(), row.record);
+                self.finish_transfer(op, &items, dest.as_deref(), cancelled, record);
             }
         }
         self.start_anim_timer();
@@ -1502,8 +1509,20 @@ impl App {
     }
 
     /// Keeps tags in step with moved or deleted files and reloads what is on screen.
-    fn finish_transfer(&mut self, op: Op, items: &[PathBuf], dest: Option<&Path>, cancelled: bool) {
+    fn finish_transfer(&mut self, op: Op, items: &[PathBuf], dest: Option<&Path>, cancelled: bool, record: bool) {
         let gone: Vec<&PathBuf> = items.iter().filter(|p| std::fs::symlink_metadata(p).is_err()).collect();
+        if record {
+            use crate::undo::Change;
+            let landed = |p: &PathBuf| dest.zip(p.file_name()).map(|(d, n)| d.join(n)).filter(|t| t.exists());
+            let change = match op {
+                Op::Move => Change::Moved(gone.iter().filter_map(|p| Some(((*p).clone(), landed(p)?))).collect()),
+                // Copies into the same folder get new names we do not know; they are left out.
+                Op::Copy => Change::Created(items.iter().filter(|p| p.parent() != dest).filter_map(landed).collect()),
+                Op::Recycle => Change::Recycled(gone.iter().map(|p| (*p).clone()).collect()),
+                Op::Delete => Change::Created(Vec::new()),
+            };
+            self.undo.push(change);
+        }
         match (op, dest) {
             (Op::Move, Some(d)) => {
                 for p in &gone {
@@ -1519,7 +1538,8 @@ impl App {
         if op == Op::Recycle && !cancelled && !gone.is_empty() {
             let n = gone.len();
             let text = if n == 1 { format!("Moved “{}” to Recycle Bin", gone[0].file_name().unwrap_or_default().to_string_lossy()) } else { format!("Moved {n} items to Recycle Bin") };
-            self.xfer.toast = Some(views::transfer::Toast { text, shown: Instant::now(), undo: Vec::new() });
+            let undo = if record { gone.iter().map(|p| (*p).clone()).collect() } else { Vec::new() };
+            self.xfer.toast = Some(views::transfer::Toast { text, shown: Instant::now(), undo });
         }
         if self.searching {
             // Keep the results; drop rows whose file is gone.
@@ -1586,9 +1606,99 @@ impl App {
                 }
                 None => {}
             },
-            Hit::PromptCard | Hit::Row | Hit::Undo => {}
+            Hit::Undo => {
+                self.xfer.toast = None;
+                self.undo_redo(false);
+            }
+            Hit::PromptCard | Hit::Row => {}
         }
         self.start_anim_timer();
+        self.invalidate();
+    }
+
+    /// Ctrl+Z / Ctrl+Y: applies the reverse (or the replay) of the last change.
+    fn undo_redo(&mut self, redo: bool) {
+        use crate::undo::Change;
+        let Some(change) = (if redo { self.undo.redo() } else { self.undo.undo() }) else { return };
+        self.undoing = true;
+        match change {
+            Change::Moved(pairs) => {
+                let mut by_folder: Vec<(PathBuf, Vec<PathBuf>)> = Vec::new();
+                for (from, to) in pairs {
+                    let Some(dir) = to.parent().map(Path::to_path_buf) else { continue };
+                    if from.parent() == Some(dir.as_path()) || from.file_name() != to.file_name() {
+                        // A rename: same folder, new name.
+                        if let Err(e) = std::fs::rename(&from, &to) {
+                            self.error = Some(format!("Undo rename failed: {e}"));
+                        }
+                    } else {
+                        match by_folder.iter_mut().find(|g| g.0 == dir) {
+                            Some(g) => g.1.push(from),
+                            None => by_folder.push((dir, vec![from])),
+                        }
+                    }
+                }
+                for (dir, items) in by_folder {
+                    self.start_transfer(Op::Move, items, Some(dir));
+                }
+            }
+            Change::Recycled(paths) => {
+                let present: Vec<PathBuf> = paths.into_iter().filter(|p| p.exists()).collect();
+                if !present.is_empty() {
+                    self.start_transfer(Op::Recycle, present, None);
+                }
+            }
+            Change::Created(paths) => {
+                let missing = crate::tools::restore_from_bin(&paths);
+                if !missing.is_empty() {
+                    self.error = Some(format!("Couldn’t find {} item(s) in the Recycle Bin.", missing.len()));
+                }
+            }
+        }
+        self.undoing = false;
+        self.reload_current();
+        self.invalidate();
+    }
+
+    /// Folders pinned to Favorites (prefs `@pins`, '|' separated: no Windows path contains it).
+    fn pins(&self) -> Vec<PathBuf> {
+        self.prefs.get("@pins").map(|v| v.split('|').filter(|s| !s.is_empty()).map(PathBuf::from).collect()).unwrap_or_default()
+    }
+
+    fn set_pin(&mut self, path: &Path, pinned: bool) {
+        let mut pins = self.pins();
+        pins.retain(|p| p != path);
+        if pinned {
+            pins.push(path.to_path_buf());
+        }
+        let v = pins.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join("|");
+        self.prefs.set("@pins", &v);
+        let _ = self.prefs.save();
+        self.sidebar.set_pins(&pins);
+        self.invalidate();
+    }
+
+    /// Header right-click in Details: show or hide columns.
+    fn column_menu(&mut self, screen: POINT) {
+        let cmd = unsafe {
+            let Ok(m) = CreatePopupMenu() else { return };
+            for (k, c) in views::list::OPTIONAL.into_iter().enumerate() {
+                let on = if self.list.shown.contains(&c) { MF_CHECKED } else { MF_UNCHECKED };
+                let _ = AppendMenuW(m, MF_STRING | on, k + 1, &windows::core::HSTRING::from(c.title()));
+            }
+            let c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, None, self.hwnd, None);
+            let _ = DestroyMenu(m);
+            c.0 as usize
+        };
+        let Some(&col) = cmd.checked_sub(1).and_then(|k| views::list::OPTIONAL.get(k)) else { return };
+        if !self.list.shown.contains(&col) {
+            self.list.shown.push(col);
+        } else {
+            self.list.shown.retain(|&c| c != col);
+        }
+        let v = views::list::OPTIONAL.into_iter().filter(|c| self.list.shown.contains(c)).map(|c| c.title()).collect::<Vec<_>>().join(",");
+        self.prefs.set("@cols", &v);
+        let _ = self.prefs.save();
         self.invalidate();
     }
 
@@ -1632,6 +1742,7 @@ impl App {
         }
         match crate::tools::new_text_file(self.current_dir()) {
             Ok(p) => {
+                self.undo.push(crate::undo::Change::Created(vec![p.clone()]));
                 if !self.columns_view() {
                     self.pending_rename = p.file_name().map(|n| n.to_os_string());
                 }
@@ -1651,6 +1762,7 @@ impl App {
         let dir = self.current_dir().to_path_buf();
         match shell::new_folder(Some(self.hwnd), &dir) {
             Ok(p) => {
+                self.undo.push(crate::undo::Change::Created(vec![p.clone()]));
                 if !self.columns_view() {
                     self.pending_rename = p.file_name().map(|n| n.to_os_string());
                 }
@@ -1714,6 +1826,7 @@ impl App {
             if let Some(parent) = path.parent() {
                 self.tags.renamed(&path, &parent.join(&new_name));
                 let _ = self.tags.save();
+                self.undo.push(crate::undo::Change::Moved(vec![(path.clone(), parent.join(&new_name))]));
             }
             self.list.entries[i].name = new_name.clone().into();
             self.pending_select = Some(new_name.into());
@@ -1773,6 +1886,23 @@ impl App {
                     }
                     on_item = true;
                 }
+            } else if self.view == View::List && self.layout.header.contains(x, y) {
+                return self.column_menu(screen);
+            } else if let Some(i) = self.sidebar.hit(x, y, self.layout.sidebar) {
+                let path = self.sidebar.place(i).map(|p| p.path.clone());
+                if let Some(p) = path.filter(|p| self.pins().contains(p)) {
+                    let cmd = unsafe {
+                        let Ok(m) = CreatePopupMenu() else { return };
+                        let _ = AppendMenuW(m, MF_STRING, 1, w!("Unpin from Favorites"));
+                        let c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, None, self.hwnd, None);
+                        let _ = DestroyMenu(m);
+                        c.0
+                    };
+                    if cmd == 1 {
+                        self.set_pin(&p, false);
+                    }
+                }
+                return;
             } else if !self.layout.content.contains(x, y) {
                 return;
             }
@@ -1805,6 +1935,7 @@ impl App {
         const SELECT_NONE: usize = 20;
         const INVERT: usize = 21;
         const TERMINAL: usize = 22;
+        const PIN: usize = 23;
         let one_file = self.selected_paths().len() == 1 && self.selected_paths()[0].is_file();
         let can_paste = shell::clipboard_get(Some(self.hwnd)).is_some();
         let cmd = unsafe {
@@ -1815,6 +1946,11 @@ impl App {
             if on_item {
                 add(OPEN, w!("Open"), MF_ENABLED);
                 add(OPEN_WITH, w!("Open with…"), if one_file { MF_ENABLED } else { MF_GRAYED });
+                if let [p] = self.selected_paths().as_slice()
+                    && p.is_dir()
+                {
+                    add(PIN, if self.pins().contains(p) { w!("Unpin from Favorites") } else { w!("Pin to Favorites") }, MF_ENABLED);
+                }
                 if self.searching {
                     add(SHOW, w!("Show in Folder"), MF_ENABLED);
                 }
@@ -1898,6 +2034,12 @@ impl App {
                 }
             }
             COPY_PATH => self.copy_as_path(),
+            PIN => {
+                if let Some(p) = self.selected_paths().pop() {
+                    let pinned = self.pins().contains(&p);
+                    self.set_pin(&p, !pinned);
+                }
+            }
             COPY_TO | MOVE_TO => self.copy_or_move_to(cmd == MOVE_TO),
             PROPERTIES if on_item => self.show_properties(),
             PROPERTIES => crate::tools::properties(&[self.current_dir().to_path_buf()]),
@@ -2055,7 +2197,12 @@ impl App {
             if let Some(tag) = self.sidebar.tag_at(i) {
                 self.show_tag(tag);
             } else if let Some(p) = self.sidebar.place(i) {
-                self.navigate(p.path.clone(), NavKind::Visit);
+                let path = p.path.clone();
+                if shell::is_recycle_bin(&path) {
+                    let _ = shell::open(Some(self.hwnd), &path);
+                } else {
+                    self.navigate(path, NavKind::Visit);
+                }
             }
         } else if let Some(p) = pathbar::hit(self, x, y) {
             self.navigate(p, NavKind::Visit);
@@ -2135,6 +2282,8 @@ impl App {
             0x46 if mods().ctrl => self.focus_search(), // Ctrl+F
             0x50 if mods().ctrl && key_down(VK_MENU.0) => self.toggle_pathbar(), // Ctrl+Alt+P
             0x43 if mods().ctrl && mods().shift => self.copy_as_path(), // Ctrl+Shift+C
+            0x5A if mods().ctrl => self.undo_redo(false),             // Ctrl+Z
+            0x59 if mods().ctrl => self.undo_redo(true),              // Ctrl+Y
             0x43 if mods().ctrl => self.copy_selection(false), // Ctrl+C
             0x4E if mods().ctrl && !mods().shift => self.new_window(), // Ctrl+N
             0x57 if mods().ctrl => unsafe {
@@ -2323,7 +2472,7 @@ impl App {
             WM_DEVICECHANGE => {
                 // DBT_DEVICEARRIVAL / DBT_DEVICEREMOVECOMPLETE: a drive may have come or gone.
                 if matches!(wp.0, 0x8000 | 0x8004) {
-                    self.sidebar.drives = shell::drives();
+                    self.sidebar.drives = views::sidebar::locations();
                     self.invalidate();
                 }
                 None
@@ -2736,6 +2885,8 @@ pub fn run() -> Result<()> {
             sheet_anim: None,
             xfer: Default::default(),
             drop_hi: None,
+            undo: Default::default(),
+            undoing: false,
             press: None,
             hover_pending: None,
             type_names: HashMap::new(),
@@ -2769,6 +2920,11 @@ pub fn run() -> Result<()> {
         app.apply_theme_to_frame();
         app.show_pathbar = app.prefs.get("@pathbar") == Some("1");
         app.settings = crate::settings::Settings::resolve(app.win_defaults, &app.prefs);
+        let pins = app.pins();
+        if let Some(v) = app.prefs.get("@cols") {
+            app.list.shown = views::list::OPTIONAL.into_iter().filter(|c| v.split(',').any(|t| t == c.title())).collect();
+        }
+        app.sidebar.set_pins(&pins);
         app.rebuild_edit_style();
         app.pending_select = select;
         app.navigate(start, NavKind::Refresh);

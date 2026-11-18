@@ -65,6 +65,13 @@ pub fn favorites() -> Vec<Place> {
     ])
 }
 
+/// The Recycle Bin place: not a folder on disk, so its path is the shell name Explorer opens.
+pub const RECYCLE_BIN: &str = "shell:RecycleBinFolder";
+
+pub fn is_recycle_bin(p: &Path) -> bool {
+    p.as_os_str() == RECYCLE_BIN
+}
+
 /// Cloud-synced roots (iCloud's place in Finder).
 pub fn cloud() -> Vec<Place> {
     places(&[("OneDrive", &FOLDERID_SkyDrive, Glyph::Cloud)])

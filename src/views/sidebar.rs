@@ -42,9 +42,25 @@ pub fn best_match(items: &[Place], current: &Path) -> Option<usize> {
         .map(|(i, _)| i)
 }
 
+/// Locations: the drives, then the Recycle Bin.
+pub fn locations() -> Vec<Place> {
+    let mut v = shell::drives();
+    v.push(Place { name: "Recycle Bin".into(), path: shell::RECYCLE_BIN.into(), glyph: Glyph::Trash });
+    v
+}
+
 impl Sidebar {
     pub fn load() -> Sidebar {
-        Sidebar { favorites: shell::favorites(), cloud: shell::cloud(), drives: shell::drives(), tags: crate::tags::Tag::ALL.to_vec(), ..Default::default() }
+        Sidebar { favorites: shell::favorites(), cloud: shell::cloud(), drives: locations(), tags: crate::tags::Tag::ALL.to_vec(), ..Default::default() }
+    }
+
+    /// Favorites = the standard places, then the user's pinned folders.
+    pub fn set_pins(&mut self, pins: &[std::path::PathBuf]) {
+        self.favorites = shell::favorites();
+        for p in pins.iter().filter(|p| p.is_dir()) {
+            let name = p.file_name().map_or_else(|| p.display().to_string(), |n| n.to_string_lossy().into_owned());
+            self.favorites.push(Place { name, path: p.clone(), glyph: Glyph::Folder });
+        }
     }
 
     fn sections(&self) -> [&[Place]; 3] {

@@ -144,6 +144,62 @@ fn build_shell_menu(paths: &[PathBuf], first: u32) -> Option<(IContextMenu, HMEN
     }
 }
 
+/// "Displaced item" properties of Recycle Bin items: the folder an item was deleted from (2) and when (3).
+const FMTID_DISPLACED: windows::core::GUID = windows::core::GUID::from_u128(0x9b174b33_40ff_11d2_a27e_00c04fc30871);
+
+/// Puts recycled items back where they were (newest match per path). Returns the paths it could not find.
+pub fn restore_from_bin(paths: &[PathBuf]) -> Vec<PathBuf> {
+    use windows::Win32::Foundation::PROPERTYKEY;
+    use windows::Win32::UI::Shell::{BHID_EnumItems, FOLDERID_RecycleBinFolder, IEnumShellItems, IShellItem2, KF_FLAG_DEFAULT, SHGetKnownFolderItem, SIGDN_NORMALDISPLAY};
+    use windows::core::Interface;
+    let from_key = PROPERTYKEY { fmtid: FMTID_DISPLACED, pid: 2 };
+    let when_key = PROPERTYKEY { fmtid: FMTID_DISPLACED, pid: 3 };
+    let take = |p: windows::core::PWSTR| unsafe {
+        let s = p.to_string().unwrap_or_default();
+        CoTaskMemFree(Some(p.0 as _));
+        s
+    };
+    // (original path, deleted time, bin item) for everything in the bin.
+    let mut items: Vec<(PathBuf, String, u64, IShellItem)> = Vec::new();
+    unsafe {
+        let Ok(bin) = SHGetKnownFolderItem::<IShellItem>(&FOLDERID_RecycleBinFolder, KF_FLAG_DEFAULT, None) else { return paths.to_vec() };
+        let Ok(en) = bin.BindToHandler::<_, IEnumShellItems>(None, &BHID_EnumItems) else { return paths.to_vec() };
+        loop {
+            let mut one = [None];
+            if en.Next(&mut one, None).is_err() {
+                break;
+            }
+            let Some(item) = one[0].take() else { break };
+            let Ok(i2) = item.cast::<IShellItem2>() else { continue };
+            let (Ok(from), Ok(name)) = (i2.GetString(&from_key), item.GetDisplayName(SIGDN_NORMALDISPLAY)) else { continue };
+            let when = i2.GetFileTime(&when_key).map_or(0, |t| ((t.dwHighDateTime as u64) << 32) | t.dwLowDateTime as u64);
+            items.push((PathBuf::from(take(from)), take(name).to_lowercase(), when, item));
+        }
+    }
+    let mut missing = Vec::new();
+    for p in paths {
+        let Some(parent) = p.parent() else { continue };
+        // The bin shows the original full path, or just the name; either may hide the extension.
+        let full = p.to_string_lossy().to_lowercase();
+        let bare = p.with_extension("").to_string_lossy().to_lowercase();
+        let name = p.file_name().unwrap_or_default().to_string_lossy().to_lowercase();
+        let stem = p.file_stem().unwrap_or_default().to_string_lossy().to_lowercase();
+        let hit = items
+            .iter()
+            .filter(|(from, shown, ..)| from.as_os_str().eq_ignore_ascii_case(parent.as_os_str()) && [&full, &bare, &name, &stem].contains(&shown))
+            .max_by_key(|i| i.2);
+        let ok = hit.is_some_and(|(.., item)| unsafe {
+            let Ok(cm) = item.BindToHandler::<_, IContextMenu>(None, &BHID_SFUIObject) else { return false };
+            let info = CMINVOKECOMMANDINFO { cbSize: size_of::<CMINVOKECOMMANDINFO>() as u32, lpVerb: PCSTR(c"undelete".as_ptr() as *const u8), ..Default::default() };
+            cm.InvokeCommand(&info).is_ok()
+        });
+        if !ok {
+            missing.push(p.clone());
+        }
+    }
+    missing
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +225,23 @@ mod tests {
         unsafe {
             let _ = DestroyMenu(menu);
         }
+        std::fs::remove_dir_all(d).unwrap();
+    }
+
+    #[test]
+    fn recycle_then_restore_puts_the_file_back() {
+        unsafe {
+            let _ = windows::Win32::System::Com::CoInitializeEx(None, windows::Win32::System::Com::COINIT_APARTMENTTHREADED);
+        }
+        let d = std::env::temp_dir().join(format!("fx-restore-{}", std::process::id()));
+        std::fs::create_dir_all(&d).unwrap();
+        let f = d.join("bring-me-back.txt");
+        std::fs::write(&f, "hello").unwrap();
+        let job = crate::transfer::build_job(crate::transfer::Op::Recycle, std::slice::from_ref(&f), None, &Default::default()).unwrap();
+        crate::transfer::run(job, Default::default(), |_| {});
+        assert!(!f.exists(), "recycled");
+        assert!(restore_from_bin(std::slice::from_ref(&f)).is_empty());
+        assert_eq!(std::fs::read_to_string(&f).unwrap(), "hello");
         std::fs::remove_dir_all(d).unwrap();
     }
 

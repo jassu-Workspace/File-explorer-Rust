@@ -13,16 +13,18 @@ use windows::Win32::UI::Input::KeyboardAndMouse::{VK_DOWN, VK_END, VK_HOME, VK_N
 pub enum Col {
     Name,
     Modified,
+    Created,
     Size,
     Kind,
     Where,
 }
 
 impl Col {
-    fn title(self) -> &'static str {
+    pub fn title(self) -> &'static str {
         match self {
             Col::Name => "Name",
             Col::Modified => "Date Modified",
+            Col::Created => "Date Created",
             Col::Size => "Size",
             Col::Kind => "Kind",
             Col::Where => "Where",
@@ -32,6 +34,7 @@ impl Col {
         match self {
             Col::Name => Some(SortKey::Name),
             Col::Modified => Some(SortKey::Modified),
+            Col::Created => Some(SortKey::Created),
             Col::Size => Some(SortKey::Size),
             Col::Kind => Some(SortKey::Kind),
             Col::Where => None,
@@ -43,8 +46,20 @@ const NAME_MIN: f32 = 200.0;
 const PAD: f32 = 10.0;
 
 /// (column, x offset from the list's left edge, width). Name takes the remaining space.
-pub fn columns(width: f32, show_where: bool) -> Vec<(Col, f32, f32)> {
-    let mut fixed = vec![(Col::Modified, 170.0), (Col::Size, 90.0), (Col::Kind, 140.0)];
+/// Columns the user can show or hide (header right-click), in display order.
+pub const OPTIONAL: [Col; 4] = [Col::Modified, Col::Created, Col::Size, Col::Kind];
+
+fn col_width(c: Col) -> f32 {
+    match c {
+        Col::Size => 90.0,
+        Col::Kind => 140.0,
+        Col::Where => 200.0,
+        _ => 170.0,
+    }
+}
+
+pub fn columns(width: f32, show_where: bool, shown: &[Col]) -> Vec<(Col, f32, f32)> {
+    let mut fixed: Vec<(Col, f32)> = OPTIONAL.into_iter().filter(|c| shown.contains(c)).map(|c| (c, col_width(c))).collect();
     if show_where {
         fixed.insert(0, (Col::Where, 200.0));
     }
@@ -85,6 +100,8 @@ pub struct ListView {
     pub type_ahead: TypeAhead,
     pub show_where: bool,
     pub hover_row: Option<usize>,
+    /// Optional Details columns that are on.
+    pub shown: Vec<Col>,
 }
 
 impl Default for ListView {
@@ -97,6 +114,7 @@ impl Default for ListView {
             type_ahead: TypeAhead::default(),
             show_where: false,
             hover_row: None,
+            shown: vec![Col::Modified, Col::Size, Col::Kind],
         }
     }
 }
@@ -202,7 +220,7 @@ impl ListView {
 
 
     pub fn col_at(&self, x_in_list: f32, width: f32) -> Option<Col> {
-        columns(width, self.show_where).into_iter().find(|c| x_in_list >= c.1 && x_in_list < c.1 + c.2).map(|c| c.0)
+        columns(width, self.show_where, &self.shown).into_iter().find(|c| x_in_list >= c.1 && x_in_list < c.1 + c.2).map(|c| c.0)
     }
 }
 
@@ -211,7 +229,7 @@ pub fn paint(app: &mut App) {
     let t = app.theme;
     let large = app.scale >= 1.5;
     let today = shell::now_local();
-    let cols = columns(rows.w, app.list.show_where);
+    let cols = columns(rows.w, app.list.show_where, &app.list.shown);
 
     // Header.
     app.gfx.fill_rect(header, t.content_bg);
@@ -274,6 +292,10 @@ pub fn paint(app: &mut App) {
                     let s = format_modified(shell::to_local(e.modified), today);
                     app.gfx.text(&s, cell, &app.gfx.fonts.body, dim);
                 }
+                Col::Created => {
+                    let s = format_modified(shell::to_local(e.created), today);
+                    app.gfx.text(&s, cell, &app.gfx.fonts.body, dim);
+                }
                 Col::Size => {
                     let s = if e.is_dir() { "--".to_string() } else { format_size(e.size) };
                     app.gfx.text(&s, cell, &app.gfx.fonts.body_right, dim);
@@ -327,12 +349,15 @@ mod tests {
 
     #[test]
     fn columns_fill_width() {
-        let c = columns(1000.0, false);
+        let shown = ListView::default().shown;
+        let c = columns(1000.0, false, &shown);
         assert_eq!(c.iter().map(|c| c.0).collect::<Vec<_>>(), [Col::Name, Col::Modified, Col::Size, Col::Kind]);
         let last = c.last().unwrap();
         assert!((last.1 + last.2 - 1000.0).abs() < 0.01);
-        assert!(columns(300.0, false)[0].2 >= 200.0);
-        assert!(columns(1000.0, true).iter().any(|c| c.0 == Col::Where));
+        assert!(columns(300.0, false, &shown)[0].2 >= 200.0);
+        assert!(columns(1000.0, true, &shown).iter().any(|c| c.0 == Col::Where));
+        let picked = columns(1000.0, false, &[Col::Kind, Col::Created]);
+        assert_eq!(picked.iter().map(|c| c.0).collect::<Vec<_>>(), [Col::Name, Col::Created, Col::Kind], "fixed order, chosen columns only");
     }
 
     #[test]

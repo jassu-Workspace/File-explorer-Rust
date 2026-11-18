@@ -49,6 +49,7 @@ pub enum Glyph {
     More,
     Clock,
     Cloud,
+    Trash,
 }
 
 /// Path data in a 16x16 box: `M x y`, `L x y`, `C x1 y1 x2 y2 x y`, `Z`, `F` (filled figure).
@@ -80,11 +81,12 @@ fn glyph_path(g: Glyph) -> &'static str {
         Glyph::Tag => "M 2 2 L 8 2 L 14.5 8.5 L 8.5 14.5 L 2 8 Z M 5 5 L 5.6 5.6",
         Glyph::Clock => "M 14 8 C 14 11.3 11.3 14 8 14 C 4.7 14 2 11.3 2 8 C 2 4.7 4.7 2 8 2 C 11.3 2 14 4.7 14 8 Z M 8 4.5 L 8 8 L 10.5 9.5",
         Glyph::Cloud => "M 4.5 12.5 C 2.8 12.5 1.5 11.2 1.5 9.6 C 1.5 8.1 2.6 6.9 4.1 6.7 C 4.6 4.6 6.4 3.2 8.5 3.2 C 11 3.2 13 5.1 13.1 7.6 C 14.2 8 15 9 15 10.2 C 15 11.5 13.9 12.5 12.6 12.5 Z",
+        Glyph::Trash => "M 2.5 4 L 13.5 4 M 6 4 L 6 2.5 L 10 2.5 L 10 4 M 3.8 4 L 4.6 14 L 11.4 14 L 12.2 4 M 6.6 6.5 L 6.8 11.5 M 9.4 6.5 L 9.2 11.5",
         Glyph::More => "M 14 8 C 14 11.3 11.3 14 8 14 C 4.7 14 2 11.3 2 8 C 2 4.7 4.7 2 8 2 C 11.3 2 14 4.7 14 8 Z M 5 8 L 5.5 8 M 7.75 8 L 8.25 8 M 10.5 8 L 11 8",
     }
 }
 
-const ALL_GLYPHS: [Glyph; 27] = [
+const ALL_GLYPHS: [Glyph; 28] = [
     Glyph::Back,
     Glyph::Forward,
     Glyph::Search,
@@ -112,6 +114,7 @@ const ALL_GLYPHS: [Glyph; 27] = [
     Glyph::More,
     Glyph::Clock,
     Glyph::Cloud,
+    Glyph::Trash,
 ];
 
 fn v(x: f32, y: f32) -> Vector2 {
