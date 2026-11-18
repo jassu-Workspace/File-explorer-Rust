@@ -43,6 +43,9 @@ pub fn paint(app: &mut App) {
         g.line(0.0, l.pathbar.y + 0.5, l.pathbar.w, l.pathbar.y + 0.5, t.separator);
         pathbar::paint(app);
     }
+    if let Some(r) = app.drop_hi {
+        app.gfx.fill_round(r, 8.0, app.theme.accent.fade(0.22));
+    }
     transfer::paint(app);
     if app.settings_open {
         settings::paint(app);

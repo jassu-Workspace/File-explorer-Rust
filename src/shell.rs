@@ -331,20 +331,26 @@ pub fn clipboard_put(hwnd: Option<HWND>, paths: &[PathBuf], cut: bool) -> window
 }
 
 /// Files on the clipboard and whether they were cut.
-pub fn clipboard_get(hwnd: Option<HWND>) -> Option<(Vec<PathBuf>, bool)> {
-    let _cb = Clipboard::open(hwnd).ok()?;
+/// File paths in a CF_HDROP block (clipboard or drag and drop).
+pub fn hdrop_paths(drop: HDROP) -> Vec<PathBuf> {
     unsafe {
-        let h = GetClipboardData(CF_HDROP.0 as u32).ok()?;
-        let drop = HDROP(h.0);
         let n = DragQueryFileW(drop, u32::MAX, None);
-        let paths: Vec<PathBuf> = (0..n)
+        (0..n)
             .map(|i| {
                 let len = DragQueryFileW(drop, i, None) as usize;
                 let mut buf = vec![0u16; len + 1];
                 DragQueryFileW(drop, i, Some(&mut buf));
                 PathBuf::from(OsString::from_wide(&buf[..len]))
             })
-            .collect();
+            .collect()
+    }
+}
+
+pub fn clipboard_get(hwnd: Option<HWND>) -> Option<(Vec<PathBuf>, bool)> {
+    let _cb = Clipboard::open(hwnd).ok()?;
+    unsafe {
+        let h = GetClipboardData(CF_HDROP.0 as u32).ok()?;
+        let paths = hdrop_paths(HDROP(h.0));
         let cut = GetClipboardData(drop_effect_format()).ok().is_some_and(|h| {
             let p = GlobalLock(HGLOBAL(h.0)) as *const u32;
             let v = if p.is_null() { 0 } else { p.read_unaligned() };

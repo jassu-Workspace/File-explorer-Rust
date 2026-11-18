@@ -1,6 +1,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod dragdrop;
 mod draw;
 mod edit;
 mod format;
@@ -20,10 +21,10 @@ mod thumbs;
 mod transfer;
 mod views;
 
-use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+use windows::Win32::System::Ole::OleInitialize;
 
 fn main() -> windows::core::Result<()> {
-    // IFileOperation and the shell need an STA on the UI thread.
-    unsafe { CoInitializeEx(None, COINIT_APARTMENTTHREADED).ok()? };
+    // IFileOperation, the shell and drag and drop need OLE (an STA) on the UI thread.
+    unsafe { OleInitialize(None)? };
     app::run()
 }

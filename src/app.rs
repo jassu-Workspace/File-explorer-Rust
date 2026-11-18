@@ -184,6 +184,8 @@ pub struct App {
     sheet_anim: Option<crate::layout::Anim>,
     /// Running transfers and their animations.
     pub xfer: views::transfer::Transfers,
+    /// Folder highlighted under a drag (drop target feedback).
+    pub drop_hi: Option<crate::layout::Rect>,
     /// Press on an item, for single-click open on release: (x, y, target, Ctrl/Shift held).
     press: Option<(f32, f32, PressTarget, bool)>,
     /// Item waiting for the hover-select timer (single-click mode).
@@ -619,9 +621,13 @@ impl App {
     }
 
     /// Opens the item a single click landed on (single-click mode), unless the press turned into a drag.
+    fn drag_threshold(&self) -> f32 {
+        (unsafe { GetSystemMetrics(SM_CXDRAG) }) as f32 / self.scale
+    }
+
     fn on_click_release(&mut self, x: f32, y: f32) {
         let Some((px, py, target, mods_held)) = self.press.take() else { return };
-        let threshold = unsafe { GetSystemMetrics(SM_CXDRAG) } as f32 / self.scale;
+        let threshold = self.drag_threshold();
         if !crate::settings::click_opens(self.settings.click, ((x - px).powi(2) + (y - py).powi(2)).sqrt(), threshold, mods_held) {
             return;
         }
@@ -1379,20 +1385,66 @@ impl App {
 
     /// On-screen center of item `i`'s icon, when it is visible in the list or icon view.
     fn item_point(&self, i: usize) -> Option<(f32, f32)> {
+        let r = self.item_rect(i)?;
+        let (x, y) = if self.view == View::Icon { (r.x + r.w / 2.0, r.y + self.icon_size / 2.0 + 8.0) } else { (r.x + 28.0, r.y + r.h / 2.0) };
+        self.item_area().contains(x, y).then_some((x, y))
+    }
+
+    /// On-screen rect of item `i` in the icon or list view.
+    fn item_rect(&self, i: usize) -> Option<crate::layout::Rect> {
         let a = self.item_area();
-        let (x, y) = match self.view {
-            View::Icon => {
-                let g = self.grid();
-                let c = g.cell(i);
-                (a.x + c.x + c.w / 2.0, a.y + c.y - self.list.scroll_y + self.icon_size / 2.0 + 8.0)
-            }
-            View::List => {
-                let c = self.list_grid().cell(i);
-                (a.x + 28.0, a.y + c.y - self.list.scroll_y + c.h / 2.0)
-            }
+        let c = match self.view {
+            View::Icon => self.grid().cell(i),
+            View::List => self.list_grid().cell(i),
             _ => return None,
         };
-        a.contains(x, y).then_some((x, y))
+        Some(crate::layout::Rect::new(a.x + c.x, a.y + c.y - self.list.scroll_y, c.w, c.h))
+    }
+
+    /// Folder a drop at (x, y) goes into, with the rect to highlight.
+    fn drop_dest_at(&self, x: f32, y: f32) -> Option<(PathBuf, crate::layout::Rect)> {
+        let side = self.layout.sidebar;
+        if side.contains(x, y) {
+            let i = self.sidebar.hit(x, y, side)?;
+            let p = self.sidebar.place(i)?;
+            let r = self.sidebar.item_rects(side).into_iter().find(|s| s.0 == i)?.1;
+            return Some((p.path.clone(), r));
+        }
+        let content = self.layout.content;
+        if !content.contains(x, y) {
+            return None;
+        }
+        if self.columns_view() {
+            let (col, row) = views::columns::hit(self, x, y)?;
+            let c = self.columns.cols.get(col)?;
+            if let Some(e) = row.and_then(|r| c.entries.as_ref()?.get(r)).filter(|e| e.is_dir()) {
+                return Some((c.path.join(&e.name), content));
+            }
+            return Some((c.path.clone(), content));
+        }
+        if let Some(Some(i)) = self.item_at(x, y)
+            && let Some(e) = self.list.entries.get(i).filter(|e| e.is_dir())
+        {
+            return Some((self.entry_path(e), self.item_rect(i)?));
+        }
+        // Empty space: the folder on screen (not a tag list or search results spread over many folders).
+        (self.tag_view.is_none() && !self.searching && self.current_dir().is_dir()).then(|| (self.current_dir().to_path_buf(), content))
+    }
+
+    fn on_drag_query(&mut self, q: &mut crate::dragdrop::Query) {
+        let target = q.at.and_then(|(px, py)| self.drop_dest_at(px as f32 / self.scale, py as f32 / self.scale));
+        let op = target.as_ref().and_then(|(dest, _)| crate::dragdrop::drop_op(&q.items, dest, q.ctrl, q.shift));
+        let hi = target.as_ref().filter(|_| op.is_some() && !q.drop).map(|t| t.1);
+        if hi != self.drop_hi {
+            self.drop_hi = hi;
+            self.invalidate();
+        }
+        q.op = op;
+        if q.drop
+            && let (Some(op), Some((dest, _))) = (op, target)
+        {
+            self.start_transfer(op, std::mem::take(&mut q.items), Some(dest));
+        }
     }
 
     /// Selected items lift off and arc to the Recycle Bin (recycle) or drop into the folder (paste).
@@ -2096,6 +2148,11 @@ impl App {
                 self.on_search_done(m.0, m.1);
                 Some(LRESULT(0))
             }
+            crate::dragdrop::WM_DRAG_QUERY => {
+                let q = unsafe { &mut *(lp.0 as *mut crate::dragdrop::Query) };
+                self.on_drag_query(q);
+                Some(LRESULT(0))
+            }
             WM_TRANSFER => {
                 let m = unsafe { Box::from_raw(lp.0 as *mut (u64, crate::transfer::Update)) };
                 let (id, u) = *m;
@@ -2217,6 +2274,19 @@ impl App {
             }
             WM_MOUSEMOVE => {
                 let (x, y) = self.client_dip(lp);
+                if let Some((px, py, ..)) = self.press
+                    && wp.0 & 0x1 != 0
+                    && ((x - px).abs() > self.drag_threshold() || (y - py).abs() > self.drag_threshold())
+                {
+                    self.press = None;
+                    let paths = self.selected_paths();
+                    if !paths.is_empty() {
+                        crate::dragdrop::drag_out(hwnd, &paths);
+                        self.drop_hi = None;
+                        self.invalidate();
+                    }
+                    return Some(LRESULT(0));
+                }
                 if self.band.is_some() {
                     self.update_band(x, y);
                     return Some(LRESULT(0));
@@ -2390,6 +2460,7 @@ impl App {
             WM_DESTROY => {
                 edit::delete_font(self.edit_font);
                 unsafe {
+                    let _ = windows::Win32::System::Ole::RevokeDragDrop(hwnd);
                     let _ = DeleteObject(self.edit_brush.into());
                     PostQuitMessage(0);
                 }
@@ -2541,6 +2612,7 @@ pub fn run() -> Result<()> {
             settings_open: false,
             sheet_anim: None,
             xfer: Default::default(),
+            drop_hi: None,
             press: None,
             hover_pending: None,
             type_names: HashMap::new(),
@@ -2578,6 +2650,7 @@ pub fn run() -> Result<()> {
         app.pending_select = select;
         app.navigate(start, NavKind::Refresh);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
+        let _ = windows::Win32::System::Ole::RegisterDragDrop(hwnd, &crate::dragdrop::Target::create(hwnd));
         // Re-run WM_NCCALCSIZE, then size the window for this monitor's DPI.
         SetWindowPos(hwnd, None, 0, 0, (WINDOW_W * scale) as i32, (WINDOW_H * scale) as i32, SWP_NOMOVE | SWP_NOZORDER | SWP_FRAMECHANGED)?;
         let _ = ShowWindow(hwnd, SW_SHOWDEFAULT);
