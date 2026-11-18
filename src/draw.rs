@@ -210,8 +210,8 @@ impl Gfx {
             pixelFormat: D2D1_PIXEL_FORMAT { format: DXGI_FORMAT_B8G8R8A8_UNORM, alphaMode: D2D1_ALPHA_MODE_PREMULTIPLIED },
             dpiX: self.dpi,
             dpiY: self.dpi,
-            // Software (WARP): GPU drivers add ~35 MB private memory per process; WARP keeps us under 25 MB.
-            r#type: D2D1_RENDER_TARGET_TYPE_SOFTWARE,
+            // DEFAULT = GPU when available, else WARP software rendering. GPU costs ~35 MB more but scrolls faster; v2 budget is 100 MB.
+            r#type: D2D1_RENDER_TARGET_TYPE_DEFAULT,
             ..Default::default()
         };
         let hprops = D2D1_HWND_RENDER_TARGET_PROPERTIES {
