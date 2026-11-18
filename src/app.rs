@@ -8,7 +8,8 @@ use crate::shell;
 use crate::theme::Theme;
 use crate::views::list::{ListAction, ListView, Mods};
 use crate::views::sidebar::Sidebar;
-use crate::views::{self, pathbar, toolbar::toolbar_rects};
+use crate::views::toolbar::{ToolbarRects, toolbar_rects};
+use crate::views::{self, pathbar};
 use std::collections::HashMap;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -61,8 +62,12 @@ pub enum Hot {
     Close,
     Back,
     Forward,
-    ViewList,
-    ViewCols,
+    View(u8),
+    Group,
+    Share,
+    Tags,
+    Action,
+    Search,
     Splitter,
 }
 
@@ -372,8 +377,21 @@ impl App {
         }
         true
     }
-    pub fn search_placeholder_visible(&self) -> bool {
-        !edit::visible(self.search_edit)
+    /// Search shows as a field while focused, typed in, or showing results; otherwise as an icon.
+    pub fn search_open(&self) -> bool {
+        self.searching || edit::visible(self.search_edit)
+    }
+
+    pub fn toolbar(&self) -> ToolbarRects {
+        toolbar_rects(&self.layout, self.search_open())
+    }
+
+    /// Active segment of the view control: Icon, List, Columns, Gallery.
+    pub fn view_index(&self) -> usize {
+        match self.view {
+            View::List => 1,
+            View::Columns => 2,
+        }
     }
 
     /// "Where" column text: the result's folder, starting with the searched folder's name.
@@ -386,11 +404,12 @@ impl App {
     }
 
     fn search_field_rect(&self) -> crate::layout::Rect {
-        let r = toolbar_rects(&self.layout).search;
+        let r = toolbar_rects(&self.layout, true).search;
         crate::layout::Rect::new(r.x + 28.0, r.y, r.w - 36.0, r.h)
     }
 
     fn focus_search(&mut self) {
+        edit::set_cue(self.search_edit, &format!("Search in {}", self.title()));
         edit::show_in(self.search_edit, self.search_field_rect(), self.scale);
         edit::focus_select_all(self.search_edit);
         self.invalidate();
@@ -480,9 +499,6 @@ impl App {
             let _ = SetFocus(Some(self.hwnd));
         }
     }
-    pub fn search_placeholder(&self) -> String {
-        format!("Search in {}", self.title())
-    }
     pub fn empty_text(&self) -> &'static str {
         "This folder is empty"
     }
@@ -495,7 +511,7 @@ impl App {
     }
 
     fn show_address(&mut self) {
-        let r = toolbar_rects(&self.layout).title;
+        let r = self.toolbar().title;
         edit::set_text(self.address, &self.current_dir().display().to_string());
         edit::show_in(self.address, crate::layout::Rect::new(r.x + 8.0, r.y, r.w - 16.0, r.h), self.scale);
         edit::focus_select_all(self.address);
@@ -514,7 +530,7 @@ impl App {
 
     fn reposition_edits(&self) {
         if self.address_visible() {
-            let r = toolbar_rects(&self.layout).title;
+            let r = self.toolbar().title;
             edit::show_in(self.address, crate::layout::Rect::new(r.x + 8.0, r.y, r.w - 16.0, r.h), self.scale);
         }
         if edit::visible(self.search_edit) {
@@ -975,20 +991,7 @@ impl App {
     }
 
     fn hot_at(&self, x: f32, y: f32) -> Hot {
-        let r = toolbar_rects(&self.layout);
-        if self.layout.splitter.contains(x, y) {
-            Hot::Splitter
-        } else if r.back.contains(x, y) {
-            Hot::Back
-        } else if r.forward.contains(x, y) {
-            Hot::Forward
-        } else if r.view_list.contains(x, y) {
-            Hot::ViewList
-        } else if r.view_cols.contains(x, y) {
-            Hot::ViewCols
-        } else {
-            Hot::None
-        }
+        if self.layout.splitter.contains(x, y) { Hot::Splitter } else { self.toolbar().hit(x, y) }
     }
 
     fn set_hot(&mut self, h: Hot) {
@@ -1034,26 +1037,19 @@ impl App {
 
     fn on_left_down(&mut self, x: f32, y: f32) {
         let l = self.layout;
-        let r = toolbar_rects(&l);
+        let r = self.toolbar();
+        let tool = r.hit(x, y);
         if l.splitter.contains(x, y) {
             self.dragging_splitter = true;
             unsafe { SetCapture(self.hwnd) };
-        } else if r.back.contains(x, y) {
-            self.go_back();
-        } else if r.forward.contains(x, y) {
-            self.go_forward();
+        } else if tool != Hot::None {
+            self.on_toolbar(tool, &r);
         } else if let Some(i) = self.sidebar.hit(x, y, l.sidebar) {
             if let Some(p) = self.sidebar.place(i) {
                 self.navigate(p.path.clone(), NavKind::Visit);
             }
         } else if let Some(p) = pathbar::hit(self, x, y) {
             self.navigate(p, NavKind::Visit);
-        } else if r.search.contains(x, y) {
-            self.focus_search();
-        } else if r.view_list.contains(x, y) {
-            self.set_view(View::List);
-        } else if r.view_cols.contains(x, y) {
-            self.set_view(View::Columns);
         } else if self.columns_view() {
             if let Some((col, row)) = views::columns::hit(self, x, y) {
                 match row {
@@ -1075,6 +1071,26 @@ impl App {
                 None => self.list.sel.clear(),
             }
             self.invalidate();
+        }
+    }
+
+    fn on_toolbar(&mut self, tool: Hot, r: &ToolbarRects) {
+        match tool {
+            Hot::Back => self.go_back(),
+            Hot::Forward => self.go_forward(),
+            Hot::View(1) => self.set_view(View::List),
+            Hot::View(2) => self.set_view(View::Columns),
+            Hot::Search => self.focus_search(),
+            Hot::Action => {
+                // Same menu as right-click, anchored under the button.
+                let mut pt = POINT { x: (r.action.x * self.scale) as i32, y: (r.action.bottom() * self.scale) as i32 };
+                unsafe {
+                    let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut pt);
+                }
+                let on_item = !self.selected_paths().is_empty();
+                self.context_menu(pt, on_item);
+            }
+            _ => {}
         }
     }
 
@@ -1216,7 +1232,7 @@ impl App {
                     let _ = ScreenToClient(hwnd, &mut pt);
                 }
                 let (x, y) = (pt.x as f32 / self.scale, pt.y as f32 / self.scale);
-                let inter = toolbar_rects(&self.layout).interactive();
+                let inter = self.toolbar().interactive();
                 let hit = nc_hit(&self.layout, &inter, x, y, self.w, self.h, RESIZE_BORDER, self.maximized());
                 Some(LRESULT(hit as isize))
             }
@@ -1315,7 +1331,7 @@ impl App {
                     && let Some(i) = self.list.row_at(y - rows.y)
                 {
                     self.open_index(i);
-                } else if toolbar_rects(&self.layout).title.contains(x, y) {
+                } else if self.toolbar().title.contains(x, y) {
                     self.show_address();
                 } else {
                     self.on_left_down(x, y);
@@ -1375,7 +1391,7 @@ impl App {
             }
             WM_GETMINMAXINFO => {
                 let mmi = unsafe { &mut *(lp.0 as *mut MINMAXINFO) };
-                mmi.ptMinTrackSize = POINT { x: (640.0 * self.scale) as i32, y: (400.0 * self.scale) as i32 };
+                mmi.ptMinTrackSize = POINT { x: (crate::views::toolbar::MIN_WINDOW_W * self.scale) as i32, y: (400.0 * self.scale) as i32 };
                 Some(LRESULT(0))
             }
             WM_DPICHANGED => {

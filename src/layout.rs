@@ -14,7 +14,7 @@ pub const HTBOTTOMLEFT: u32 = 16;
 pub const HTBOTTOMRIGHT: u32 = 17;
 pub const HTCLOSE: u32 = 20;
 
-pub const TOOLBAR_H: f32 = 52.0;
+pub const TOOLBAR_H: f32 = 64.0;
 pub const PATHBAR_H: f32 = 28.0;
 pub const HEADER_H: f32 = 28.0;
 pub const CAPTION_BTN_W: f32 = 46.0;
@@ -62,7 +62,9 @@ pub struct Layout {
 pub fn compute_layout(w: f32, h: f32, sidebar_w: f32, scale: f32) -> Layout {
     let (tb, pb, hd) = (TOOLBAR_H * scale, PATHBAR_H * scale, HEADER_H * scale);
     let (bw, bh) = (CAPTION_BTN_W * scale, CAPTION_BTN_H * scale);
-    let sw = sidebar_w.clamp(SIDEBAR_MIN * scale, SIDEBAR_MAX * scale).min(w);
+    // Leave the toolbar 600 DIPs so its controls never overlap the title.
+    let max = (SIDEBAR_MAX * scale).min(w - 600.0 * scale).max(SIDEBAR_MIN * scale);
+    let sw = sidebar_w.clamp(SIDEBAR_MIN * scale, max).min(w);
     let mid_h = (h - tb - pb).max(0.0);
     let content = Rect::new(sw, tb, w - sw, mid_h);
     Layout {
@@ -164,13 +166,13 @@ mod tests {
     #[test]
     fn layout_regions_tile() {
         let l = compute_layout(1200.0, 800.0, 200.0, 1.0);
-        assert_eq!(l.toolbar, Rect { x: 0.0, y: 0.0, w: 1200.0, h: 52.0 });
+        assert_eq!(l.toolbar, Rect { x: 0.0, y: 0.0, w: 1200.0, h: 64.0 });
         assert_eq!(l.pathbar.y, 772.0);
-        assert_eq!(l.sidebar, Rect { x: 0.0, y: 52.0, w: 200.0, h: 720.0 });
+        assert_eq!(l.sidebar, Rect { x: 0.0, y: 64.0, w: 200.0, h: 708.0 });
         assert_eq!(l.content.x, 200.0);
         assert_eq!(l.content.w, 1000.0);
         assert_eq!(l.header.h, 28.0);
-        assert_eq!(l.rows.y, 80.0);
+        assert_eq!(l.rows.y, 92.0);
         assert_eq!(l.close_btn.x, 1154.0);
         assert_eq!(l.max_btn.x, 1108.0);
         assert_eq!(l.min_btn.x, 1062.0);

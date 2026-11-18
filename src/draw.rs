@@ -40,6 +40,12 @@ pub enum Glyph {
     Chevron,
     SortUp,
     SortDown,
+    Grid,
+    Gallery,
+    Group,
+    Share,
+    Tag,
+    More,
 }
 
 /// Path data in a 16x16 box: `M x y`, `L x y`, `C x1 y1 x2 y2 x y`, `Z`, `F` (filled figure).
@@ -64,10 +70,16 @@ fn glyph_path(g: Glyph) -> &'static str {
         Glyph::Chevron => "M 6 4 L 10 8 L 6 12",
         Glyph::SortUp => "M 4 10 L 8 6 L 12 10",
         Glyph::SortDown => "M 4 6 L 8 10 L 12 6",
+        Glyph::Grid => "M 2.5 2.5 L 7 2.5 L 7 7 L 2.5 7 Z M 9 2.5 L 13.5 2.5 L 13.5 7 L 9 7 Z M 2.5 9 L 7 9 L 7 13.5 L 2.5 13.5 Z M 9 9 L 13.5 9 L 13.5 13.5 L 9 13.5 Z",
+        Glyph::Gallery => "M 2 2.5 L 14 2.5 L 14 10 L 2 10 Z M 2 12.5 L 4.5 12.5 L 4.5 14 L 2 14 Z M 6.75 12.5 L 9.25 12.5 L 9.25 14 L 6.75 14 Z M 11.5 12.5 L 14 12.5 L 14 14 L 11.5 14 Z",
+        Glyph::Group => "M 2 3 L 14 3 L 14 7 L 2 7 Z M 2 9 L 14 9 L 14 13 L 2 13 Z",
+        Glyph::Share => "M 8 1.5 L 8 10 M 5 4.5 L 8 1.5 L 11 4.5 M 5.5 7 L 3 7 L 3 14.5 L 13 14.5 L 13 7 L 10.5 7",
+        Glyph::Tag => "M 2 2 L 8 2 L 14.5 8.5 L 8.5 14.5 L 2 8 Z M 5 5 L 5.6 5.6",
+        Glyph::More => "M 14 8 C 14 11.3 11.3 14 8 14 C 4.7 14 2 11.3 2 8 C 2 4.7 4.7 2 8 2 C 11.3 2 14 4.7 14 8 Z M 5 8 L 5.5 8 M 7.75 8 L 8.25 8 M 10.5 8 L 11 8",
     }
 }
 
-const ALL_GLYPHS: [Glyph; 19] = [
+const ALL_GLYPHS: [Glyph; 25] = [
     Glyph::Back,
     Glyph::Forward,
     Glyph::Search,
@@ -87,6 +99,12 @@ const ALL_GLYPHS: [Glyph; 19] = [
     Glyph::Chevron,
     Glyph::SortUp,
     Glyph::SortDown,
+    Glyph::Grid,
+    Glyph::Gallery,
+    Glyph::Group,
+    Glyph::Share,
+    Glyph::Tag,
+    Glyph::More,
 ];
 
 fn v(x: f32, y: f32) -> Vector2 {
@@ -147,6 +165,7 @@ pub struct Fonts {
     pub small: IDWriteTextFormat,
     pub small_right: IDWriteTextFormat,
     pub big: IDWriteTextFormat,
+    pub caption: IDWriteTextFormat,
 }
 
 fn text_format(dw: &IDWriteFactory, size: f32, weight: DWRITE_FONT_WEIGHT, align: DWRITE_TEXT_ALIGNMENT) -> Result<IDWriteTextFormat> {
@@ -193,6 +212,7 @@ impl Gfx {
             small: text_format(&dw, 11.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_LEADING)?,
             small_right: text_format(&dw, 11.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_TRAILING)?,
             big: text_format(&dw, 15.0, DWRITE_FONT_WEIGHT_SEMI_BOLD, DWRITE_TEXT_ALIGNMENT_CENTER)?,
+            caption: text_format(&dw, 10.5, DWRITE_FONT_WEIGHT_NORMAL, DWRITE_TEXT_ALIGNMENT_CENTER)?,
         };
         let mut glyphs = HashMap::new();
         for g in ALL_GLYPHS {

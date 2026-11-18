@@ -5,7 +5,7 @@ use windows::Win32::Graphics::Gdi::{
     CLEARTYPE_QUALITY, CLIP_DEFAULT_PRECIS, CreateFontW, DEFAULT_CHARSET, DEFAULT_PITCH, DeleteObject, FF_DONTCARE, FW_NORMAL, HFONT,
     OUT_DEFAULT_PRECIS,
 };
-use windows::Win32::UI::Controls::{EM_SETMARGINS, EM_SETSEL};
+use windows::Win32::UI::Controls::{EM_SETCUEBANNER, EM_SETMARGINS, EM_SETSEL};
 use windows::Win32::UI::Input::KeyboardAndMouse::{SetFocus, VK_DOWN, VK_ESCAPE, VK_RETURN, VK_UP};
 use windows::Win32::UI::Shell::{DefSubclassProc, SetWindowSubclass};
 use windows::Win32::UI::WindowsAndMessaging::*;
@@ -131,6 +131,14 @@ pub fn focus_select(h: HWND, start: usize, end: usize) {
     unsafe {
         let _ = SetFocus(Some(h));
         SendMessageW(h, EM_SETSEL, Some(WPARAM(start)), Some(LPARAM(end as isize)));
+    }
+}
+
+/// Grey hint text shown while the field is empty, even when focused.
+pub fn set_cue(h: HWND, text: &str) {
+    let w = HSTRING::from(text);
+    unsafe {
+        SendMessageW(h, EM_SETCUEBANNER, Some(WPARAM(1)), Some(LPARAM(w.as_ptr() as isize)));
     }
 }
 
