@@ -246,7 +246,7 @@ pub fn paint(app: &mut App) {
                             app.gfx.bitmap(&b, icon);
                         }
                     }
-                    let name = e.name.to_string_lossy();
+                    let name = shell::display_name(e);
                     app.gfx.text(&name, Rect::new(cell.x + 24.0, y, cell.w - 24.0, ROW_H), &app.gfx.fonts.body, fg);
                 }
                 Col::Modified => {

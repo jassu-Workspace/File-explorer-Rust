@@ -13,13 +13,15 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Shell::{
-    FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Pictures, FOLDERID_Profile, KF_FLAG_DEFAULT, SHFILEINFOW, SHGFI_FLAGS,
+    FOLDERID_CommonPrograms, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_Recent,
+    FOLDERID_SkyDrive, KF_FLAG_DEFAULT, SHFILEINFOW, SHGFI_FLAGS,
     SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SHGetKnownFolderPath,
 };
 use windows::core::{GUID, PCWSTR};
 
 const DRIVE_REMOVABLE: u32 = 2;
 const DRIVE_FIXED: u32 = 3;
+const DRIVE_REMOTE: u32 = 4;
 
 #[derive(Clone, Debug)]
 pub struct Place {
@@ -41,17 +43,41 @@ fn known(id: &GUID) -> Option<PathBuf> {
     }
 }
 
+fn places(list: &[(&str, &GUID, Glyph)]) -> Vec<Place> {
+    list.iter().filter_map(|&(name, id, glyph)| known(id).filter(|p| p.is_dir()).map(|path| Place { name: name.into(), path, glyph })).collect()
+}
+
+pub fn home() -> Option<PathBuf> {
+    known(&FOLDERID_Profile)
+}
+
+/// Finder's Favorites, mapped to Windows folders.
 pub fn favorites() -> Vec<Place> {
-    [
-        ("Home", &FOLDERID_Profile, Glyph::Home),
+    places(&[
+        ("Recents", &FOLDERID_Recent, Glyph::Clock),
+        // shortcut: all-users Start menu only; per-user app shortcuts live in FOLDERID_Programs. Merge both when a virtual folder exists.
+        ("Applications", &FOLDERID_CommonPrograms, Glyph::Grid),
         ("Desktop", &FOLDERID_Desktop, Glyph::Desktop),
         ("Documents", &FOLDERID_Documents, Glyph::Doc),
         ("Downloads", &FOLDERID_Downloads, Glyph::Download),
+        ("Home", &FOLDERID_Profile, Glyph::Home),
         ("Pictures", &FOLDERID_Pictures, Glyph::Picture),
-    ]
-    .into_iter()
-    .filter_map(|(name, id, glyph)| known(id).filter(|p| p.is_dir()).map(|path| Place { name: name.into(), path, glyph }))
-    .collect()
+    ])
+}
+
+/// Cloud-synced roots (iCloud's place in Finder).
+pub fn cloud() -> Vec<Place> {
+    places(&[("OneDrive", &FOLDERID_SkyDrive, Glyph::Cloud)])
+}
+
+/// Name shown to the user: shortcut extensions are hidden, like Explorer does.
+pub fn display_name(e: &Entry) -> String {
+    let name = e.name.to_string_lossy();
+    let lower = name.to_ascii_lowercase();
+    match [".lnk", ".url"].iter().find(|x| !e.is_dir() && lower.ends_with(*x)) {
+        Some(x) => name[..name.len() - x.len()].to_string(),
+        None => name.into_owned(),
+    }
 }
 
 pub fn drives() -> Vec<Place> {
@@ -63,6 +89,10 @@ pub fn drives() -> Vec<Place> {
             let root = PathBuf::from(format!("{letter}:\\"));
             let w = wide(&root);
             let kind = unsafe { GetDriveTypeW(PCWSTR(w.as_ptr())) };
+            if kind == DRIVE_REMOTE {
+                // No volume query: a disconnected network drive can block for seconds.
+                return Some(Place { name: format!("Network Drive ({letter}:)"), path: root, glyph: Glyph::Drive });
+            }
             if kind != DRIVE_FIXED && kind != DRIVE_REMOVABLE {
                 return None;
             }
@@ -364,9 +394,21 @@ mod tests {
     #[test]
     fn favorites_exist() {
         let f = favorites();
-        assert!(!f.is_empty());
+        let names: Vec<&str> = f.iter().map(|p| p.name.as_str()).collect();
         assert!(f.iter().all(|p| p.path.is_dir()));
-        assert_eq!(f[0].name, "Home");
+        assert_eq!(names.first(), Some(&"Recents"));
+        assert!(names.contains(&"Applications") && names.contains(&"Home"), "{names:?}");
+        assert_eq!(home().unwrap(), f.iter().find(|p| p.name == "Home").unwrap().path);
+    }
+
+    #[test]
+    fn display_name_hides_shortcut_extensions() {
+        let e = |n: &str| Entry { name: n.into(), size: 0, modified: 0, attrs: 0x20, rel_dir: None };
+        assert_eq!(display_name(&e("Report.docx.lnk")), "Report.docx");
+        assert_eq!(display_name(&e("Site.URL")), "Site");
+        assert_eq!(display_name(&e("notes.txt")), "notes.txt");
+        let dir = Entry { attrs: 0x10, ..e("folder.lnk") };
+        assert_eq!(display_name(&dir), "folder.lnk", "folders keep their name");
     }
 
     #[test]

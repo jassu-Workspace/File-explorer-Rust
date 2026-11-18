@@ -1044,6 +1044,9 @@ impl App {
             unsafe { SetCapture(self.hwnd) };
         } else if tool != Hot::None {
             self.on_toolbar(tool, &r);
+        } else if let Some(s) = self.sidebar.header_at(x, y, l.sidebar) {
+            self.sidebar.collapsed[s] = !self.sidebar.collapsed[s];
+            self.invalidate();
         } else if let Some(i) = self.sidebar.hit(x, y, l.sidebar) {
             if let Some(p) = self.sidebar.place(i) {
                 self.navigate(p.path.clone(), NavKind::Visit);
@@ -1295,6 +1298,11 @@ impl App {
                 let rows = self.layout.rows;
                 let hover = if rows.contains(x, y) { self.list.row_at(y - rows.y) } else { None };
                 let side = self.sidebar.hit(x, y, self.layout.sidebar);
+                let header = self.sidebar.header_at(x, y, self.layout.sidebar);
+                if header != self.sidebar.hover_header {
+                    self.sidebar.hover_header = header;
+                    self.invalidate();
+                }
                 if hover != self.list.hover_row && hover.is_some() && self.animations {
                     self.hover_anim = Some(crate::layout::Anim::new(0.0, 1.0, HOVER_ANIM, Instant::now()));
                     self.start_anim_timer();
@@ -1465,7 +1473,7 @@ fn animations_enabled() -> bool {
 }
 
 fn start_folder() -> PathBuf {
-    shell::favorites().into_iter().next().map(|p| p.path).unwrap_or_else(|| PathBuf::from("C:\\"))
+    shell::home().unwrap_or_else(|| PathBuf::from("C:\\"))
 }
 
 pub fn run() -> Result<()> {

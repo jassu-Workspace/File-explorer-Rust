@@ -46,6 +46,8 @@ pub enum Glyph {
     Share,
     Tag,
     More,
+    Clock,
+    Cloud,
 }
 
 /// Path data in a 16x16 box: `M x y`, `L x y`, `C x1 y1 x2 y2 x y`, `Z`, `F` (filled figure).
@@ -75,11 +77,13 @@ fn glyph_path(g: Glyph) -> &'static str {
         Glyph::Group => "M 2 3 L 14 3 L 14 7 L 2 7 Z M 2 9 L 14 9 L 14 13 L 2 13 Z",
         Glyph::Share => "M 8 1.5 L 8 10 M 5 4.5 L 8 1.5 L 11 4.5 M 5.5 7 L 3 7 L 3 14.5 L 13 14.5 L 13 7 L 10.5 7",
         Glyph::Tag => "M 2 2 L 8 2 L 14.5 8.5 L 8.5 14.5 L 2 8 Z M 5 5 L 5.6 5.6",
+        Glyph::Clock => "M 14 8 C 14 11.3 11.3 14 8 14 C 4.7 14 2 11.3 2 8 C 2 4.7 4.7 2 8 2 C 11.3 2 14 4.7 14 8 Z M 8 4.5 L 8 8 L 10.5 9.5",
+        Glyph::Cloud => "M 4.5 12.5 C 2.8 12.5 1.5 11.2 1.5 9.6 C 1.5 8.1 2.6 6.9 4.1 6.7 C 4.6 4.6 6.4 3.2 8.5 3.2 C 11 3.2 13 5.1 13.1 7.6 C 14.2 8 15 9 15 10.2 C 15 11.5 13.9 12.5 12.6 12.5 Z",
         Glyph::More => "M 14 8 C 14 11.3 11.3 14 8 14 C 4.7 14 2 11.3 2 8 C 2 4.7 4.7 2 8 2 C 11.3 2 14 4.7 14 8 Z M 5 8 L 5.5 8 M 7.75 8 L 8.25 8 M 10.5 8 L 11 8",
     }
 }
 
-const ALL_GLYPHS: [Glyph; 25] = [
+const ALL_GLYPHS: [Glyph; 27] = [
     Glyph::Back,
     Glyph::Forward,
     Glyph::Search,
@@ -105,6 +109,8 @@ const ALL_GLYPHS: [Glyph; 25] = [
     Glyph::Share,
     Glyph::Tag,
     Glyph::More,
+    Glyph::Clock,
+    Glyph::Cloud,
 ];
 
 fn v(x: f32, y: f32) -> Vector2 {
