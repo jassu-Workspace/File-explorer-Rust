@@ -10,7 +10,8 @@ use windows::Win32::Graphics::Direct2D::*;
 use windows::Win32::Graphics::DirectWrite::*;
 use windows::Win32::Graphics::Dxgi::Common::DXGI_FORMAT_B8G8R8A8_UNORM;
 use windows::Win32::Graphics::Imaging::{
-    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapDitherTypeNone, WICBitmapPaletteTypeMedianCut,
+    CLSID_WICImagingFactory, GUID_WICPixelFormat32bppPBGRA, IWICImagingFactory, WICBitmapDitherTypeNone, WICBitmapIgnoreAlpha, WICBitmapPaletteTypeMedianCut,
+    WICBitmapUsePremultipliedAlpha,
 };
 use windows::Win32::System::Com::{CLSCTX_INPROC_SERVER, CoCreateInstance};
 use windows::Win32::UI::Controls::{IImageList, ILD_NORMAL};
@@ -215,6 +216,8 @@ pub struct Gfx {
     rt: Option<ID2D1HwndRenderTarget>,
     brush: Option<ID2D1SolidColorBrush>,
     icons: HashMap<i32, Option<ID2D1Bitmap>>,
+    /// Thumbnails, capped at 20 MB of pixels.
+    thumbs: crate::thumbs::Lru<crate::thumbs::ThumbKey, ID2D1Bitmap>,
     wic: Option<IWICImagingFactory>,
     dpi: f32,
 }
@@ -252,7 +255,7 @@ impl Gfx {
         for g in ALL_GLYPHS {
             glyphs.insert(g, build_geometry(&factory, glyph_path(g))?);
         }
-        Ok(Gfx { factory, dw, fonts, glyphs, rt: None, brush: None, icons: HashMap::new(), wic: None, dpi: 96.0 })
+        Ok(Gfx { factory, dw, fonts, glyphs, rt: None, brush: None, icons: HashMap::new(), thumbs: crate::thumbs::Lru::new(20 << 20), wic: None, dpi: 96.0 })
     }
 
     /// Creates the render target on first use or after device loss.
@@ -315,6 +318,7 @@ impl Gfx {
                 self.rt = None;
                 self.brush = None;
                 self.icons.clear();
+                self.thumbs.clear();
                 Ok(())
             }
             r => r,
@@ -401,6 +405,46 @@ impl Gfx {
         if let Some(rt) = &self.rt {
             unsafe { rt.PopAxisAlignedClip() };
         }
+    }
+
+    pub fn thumb(&mut self, key: &crate::thumbs::ThumbKey) -> Option<ID2D1Bitmap> {
+        self.thumbs.get(key).cloned()
+    }
+
+    /// Takes ownership of `hbitmap`: converts it to a D2D bitmap, caches it, and frees the GDI handle.
+    pub fn add_thumb(&mut self, key: crate::thumbs::ThumbKey, hbitmap: isize, alpha: bool) {
+        let h = windows::Win32::Graphics::Gdi::HBITMAP(hbitmap as *mut _);
+        let made = (|| -> Result<(ID2D1Bitmap, usize)> {
+            let rt = self.rt.as_ref().ok_or_else(windows::core::Error::empty)?;
+            if self.wic.is_none() {
+                self.wic = Some(unsafe { CoCreateInstance(&CLSID_WICImagingFactory, None, CLSCTX_INPROC_SERVER)? });
+            }
+            let wic = self.wic.as_ref().unwrap();
+            unsafe {
+                let opt = if alpha { WICBitmapUsePremultipliedAlpha } else { WICBitmapIgnoreAlpha };
+                let src = wic.CreateBitmapFromHBITMAP(h, Default::default(), opt)?;
+                let conv = wic.CreateFormatConverter()?;
+                conv.Initialize(&src, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)?;
+                let b = rt.CreateBitmapFromWicBitmap(&conv, None)?;
+                let s = b.GetPixelSize();
+                Ok((b, (s.width * s.height * 4) as usize))
+            }
+        })();
+        crate::thumbs::free(hbitmap);
+        if let Ok((b, bytes)) = made {
+            self.thumbs.insert(key, b, bytes);
+        }
+    }
+
+    /// Draws `bmp` scaled to fit inside `r`, centered, keeping its aspect ratio.
+    pub fn bitmap_fit(&self, bmp: &ID2D1Bitmap, r: Rect) {
+        let s = unsafe { bmp.GetSize() };
+        if s.width <= 0.0 || s.height <= 0.0 {
+            return;
+        }
+        let k = (r.w / s.width).min(r.h / s.height);
+        let (w, h) = (s.width * k, s.height * k);
+        self.bitmap(bmp, Rect::new(r.x + (r.w - w) / 2.0, r.y + (r.h - h) / 2.0, w, h));
     }
 
     /// System image-list icon as a D2D bitmap, converted once per index and cached until device loss.

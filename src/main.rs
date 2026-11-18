@@ -11,6 +11,7 @@ mod search;
 mod selection;
 mod shell;
 mod theme;
+mod thumbs;
 mod views;
 
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};

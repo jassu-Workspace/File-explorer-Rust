@@ -40,6 +40,7 @@ pub const WM_LISTING_DONE: u32 = WM_APP + 1;
 pub const WM_SEARCH_BATCH: u32 = WM_APP + 2;
 pub const WM_SEARCH_DONE: u32 = WM_APP + 3;
 pub const WM_COLUMN_DONE: u32 = WM_APP + 4;
+pub const WM_THUMB_DONE: u32 = WM_APP + 5;
 const ID_SEARCH_TIMER: usize = 1;
 const SEARCH_DEBOUNCE_MS: u32 = 150;
 const ID_ANIM_TIMER: usize = 2;
@@ -116,6 +117,10 @@ pub struct App {
     band: Option<(f32, f32, Vec<usize>, f32, f32)>,
     /// Icon-view icon size in DIPs (Ctrl+Plus / Ctrl+Minus).
     pub icon_size: f32,
+    thumbnailer: Option<crate::thumbs::Thumbnailer>,
+    thumb_pending: std::collections::HashSet<crate::thumbs::ThumbKey>,
+    /// Files Windows has no thumbnail for; not asked again.
+    thumb_none: std::collections::HashSet<crate::thumbs::ThumbKey>,
     pub columns: Columns,
     pub error: Option<String>,
     pub loading: bool,
@@ -326,6 +331,41 @@ impl App {
         }
         self.list.sel.set(sel);
         self.invalidate();
+    }
+
+    /// The cached thumbnail for a file, or `None` after queueing a request for it.
+    pub fn thumb_or_request(&mut self, path: PathBuf, drawn_px: f32) -> Option<windows::Win32::Graphics::Direct2D::ID2D1Bitmap> {
+        let key = (path, crate::thumbs::bucket(drawn_px * self.scale));
+        if let Some(b) = self.gfx.thumb(&key) {
+            return Some(b);
+        }
+        if !self.thumb_none.contains(&key) && self.thumb_pending.insert(key.clone()) {
+            if self.thumbnailer.is_none() {
+                self.thumbnailer = Some(crate::thumbs::Thumbnailer::start(self.send_hwnd()));
+            }
+            if let Some(t) = &self.thumbnailer {
+                t.request(key);
+            }
+        }
+        None
+    }
+
+    fn on_thumb(&mut self, d: crate::thumbs::ThumbDone) {
+        let current = self.thumbnailer.as_ref().is_some_and(|t| t.is_current(d.generation));
+        self.thumb_pending.remove(&d.key);
+        match d.bitmap {
+            Some((h, alpha)) if current => {
+                self.gfx.add_thumb(d.key, h, alpha);
+                self.invalidate();
+            }
+            Some((h, _)) => crate::thumbs::free(h),
+            None => {
+                if self.thumb_none.len() > 50_000 {
+                    self.thumb_none.clear(); // keep the negative cache bounded
+                }
+                self.thumb_none.insert(d.key);
+            }
+        }
     }
 
     pub fn grid(&self) -> views::grid::Grid {
@@ -702,6 +742,10 @@ impl App {
         let generation = self.listing_gen.next();
         let (hwnd, show_hidden) = (self.send_hwnd(), self.show_hidden);
         self.loading = true;
+        if let Some(t) = &self.thumbnailer {
+            t.new_generation();
+        }
+        self.thumb_pending.clear();
         std::thread::spawn(move || {
             let result = read_folder(&path, show_hidden);
             // Off the UI thread: GetDiskFreeSpaceEx can stall on network shares.
@@ -1297,6 +1341,11 @@ impl App {
                 self.on_search_done(m.0, m.1);
                 Some(LRESULT(0))
             }
+            WM_THUMB_DONE => {
+                let d = unsafe { Box::from_raw(lp.0 as *mut crate::thumbs::ThumbDone) };
+                self.on_thumb(*d);
+                Some(LRESULT(0))
+            }
             WM_COLUMN_DONE => {
                 let m = unsafe { Box::from_raw(lp.0 as *mut (PathBuf, io::Result<Vec<Entry>>)) };
                 let (path, result) = *m;
@@ -1656,6 +1705,9 @@ pub fn run() -> Result<()> {
             view: View::Icon,
             icon_size: views::grid::ICON_DEFAULT,
             band: None,
+            thumbnailer: None,
+            thumb_pending: Default::default(),
+            thumb_none: Default::default(),
             columns: Columns::default(),
             error: None,
             loading: false,

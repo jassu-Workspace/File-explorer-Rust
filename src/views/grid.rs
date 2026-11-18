@@ -144,9 +144,14 @@ pub fn paint(app: &mut App) {
         if e.is_dir() {
             paint_folder(app, icon);
         } else {
-            let idx = shell::icon_index(e, &mut app.icon_idx);
-            if let Some(b) = app.gfx.icon(idx, IconSize::Jumbo) {
-                app.gfx.bitmap(&b, icon);
+            let path = app.entry_path(&app.list.entries[i]);
+            if let Some(t) = app.thumb_or_request(path, grid.icon) {
+                app.gfx.bitmap_fit(&t, icon);
+            } else {
+                let idx = shell::icon_index(&app.list.entries[i], &mut app.icon_idx);
+                if let Some(b) = app.gfx.icon(idx, IconSize::Jumbo) {
+                    app.gfx.bitmap(&b, icon);
+                }
             }
         }
         let name = shell::display_name(&app.list.entries[i]);
