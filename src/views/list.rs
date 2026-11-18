@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::draw::{Glyph, IconSize};
 use crate::format::{format_modified, format_size};
-use crate::layout::{Rect, row_at, visible_rows};
+use crate::layout::Rect;
 use crate::listing::{Entry, SortKey, sort_entries};
 use crate::selection::{Selection, TypeAhead, find_prefix};
 use crate::shell;
@@ -126,9 +126,6 @@ impl ListView {
         }
     }
 
-    pub fn max_scroll(&self, viewport_h: f32) -> f32 {
-        (self.entries.len() as f32 * ROW_H - viewport_h).max(0.0)
-    }
 
     pub fn ensure_visible(&mut self, i: usize, viewport_h: f32) {
         let top = i as f32 * ROW_H;
@@ -183,9 +180,6 @@ impl ListView {
         }
     }
 
-    pub fn row_at(&self, y_in_rows: f32) -> Option<usize> {
-        row_at(y_in_rows, self.scroll_y, ROW_H, self.entries.len())
-    }
 
     pub fn col_at(&self, x_in_list: f32, width: f32) -> Option<Col> {
         columns(width, self.show_where).into_iter().find(|c| x_in_list >= c.1 && x_in_list < c.1 + c.2).map(|c| c.0)
@@ -217,9 +211,13 @@ pub fn paint(app: &mut App) {
     app.gfx.line(header.x, header.bottom() - 0.5, header.right(), header.bottom() - 0.5, t.separator);
 
     app.gfx.push_clip(rows);
-    let range = visible_rows(app.list.scroll_y, rows.h, ROW_H, app.list.entries.len());
-    for i in range {
-        let y = rows.y + i as f32 * ROW_H - app.list.scroll_y;
+    let geo = app.list_grid();
+    let n = app.list.entries.len();
+    for (label, y) in geo.headers(n) {
+        crate::views::grid::paint_header(app, &label, Rect::new(rows.x, rows.y + y - app.list.scroll_y, rows.w, crate::views::grid::HEADER_H));
+    }
+    for i in geo.visible(app.list.scroll_y, rows.h, n) {
+        let y = rows.y + geo.cell(i).y - app.list.scroll_y;
         let selected = app.list.sel.is_selected(i);
         let bg = Rect::new(rows.x + 6.0, y + 1.0, rows.w - 12.0, ROW_H - 2.0);
         if selected {

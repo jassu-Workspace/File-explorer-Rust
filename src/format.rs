@@ -1,3 +1,34 @@
+const MONTH_NAMES: [&str; 12] =
+    ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
+
+/// Finder-like size groups: (rank, label).
+pub fn size_group(is_dir: bool, bytes: u64) -> (i64, &'static str) {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    match bytes {
+        _ if is_dir => (0, "Folders"),
+        0 => (1, "Zero"),
+        b if b < 16 * KB => (2, "Tiny (< 16 KB)"),
+        b if b < MB => (3, "Small (16 KB – 1 MB)"),
+        b if b < 128 * MB => (4, "Medium (1 – 128 MB)"),
+        b if b < 1024 * MB => (5, "Large (128 MB – 1 GB)"),
+        _ => (6, "Huge (> 1 GB)"),
+    }
+}
+
+/// Finder-like date groups, newest first: Today, Yesterday, Previous 7/30 Days, month names this year, then years.
+pub fn date_group(t: LocalTime, today: LocalTime) -> (i64, String) {
+    let days = day_number(today) - day_number(t);
+    match days {
+        ..=0 => (0, "Today".into()),
+        1 => (1, "Yesterday".into()),
+        2..=7 => (2, "Previous 7 Days".into()),
+        8..=30 => (3, "Previous 30 Days".into()),
+        _ if t.year == today.year => (4 + (today.month as i64 - t.month as i64), MONTH_NAMES[(t.month.clamp(1, 12) - 1) as usize].into()),
+        _ => (100 + (today.year as i64 - t.year as i64), t.year.to_string()),
+    }
+}
+
 const MONTHS: [&str; 12] = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"];
 
 /// 1024-based. KB without decimals; MB and above with one decimal.
@@ -58,6 +89,29 @@ mod tests {
         for (b, s) in [(0, "0 bytes"), (1, "1 byte"), (900, "900 bytes"), (4096, "4 KB"), (1_258_291, "1.2 MB"), (5_368_709_120, "5.0 GB")] {
             assert_eq!(format_size(b), s, "{b}");
         }
+    }
+
+    #[test]
+    fn size_groups() {
+        assert_eq!(size_group(true, 0), (0, "Folders"));
+        assert_eq!(size_group(false, 0), (1, "Zero"));
+        assert_eq!(size_group(false, 10_000), (2, "Tiny (< 16 KB)"));
+        assert_eq!(size_group(false, 500_000), (3, "Small (16 KB – 1 MB)"));
+        assert_eq!(size_group(false, 50 << 20), (4, "Medium (1 – 128 MB)"));
+        assert_eq!(size_group(false, 500 << 20), (5, "Large (128 MB – 1 GB)"));
+        assert_eq!(size_group(false, 5 << 30), (6, "Huge (> 1 GB)"));
+    }
+
+    #[test]
+    fn date_groups_like_finder() {
+        let today = lt(2026, 11, 18, 12, 0);
+        assert_eq!(date_group(lt(2026, 11, 18, 1, 0), today), (0, "Today".to_string()));
+        assert_eq!(date_group(lt(2026, 11, 17, 1, 0), today), (1, "Yesterday".to_string()));
+        assert_eq!(date_group(lt(2026, 11, 12, 1, 0), today), (2, "Previous 7 Days".to_string()));
+        assert_eq!(date_group(lt(2026, 10, 25, 1, 0), today), (3, "Previous 30 Days".to_string()));
+        assert_eq!(date_group(lt(2026, 9, 2, 1, 0), today), (6, "September".to_string()), "months this year, newest first");
+        assert_eq!(date_group(lt(2024, 3, 2, 1, 0), today), (102, "2024".to_string()), "older years by year");
+        assert!(date_group(lt(2026, 9, 2, 1, 0), today).0 < date_group(lt(2025, 12, 2, 1, 0), today).0);
     }
 
     #[test]

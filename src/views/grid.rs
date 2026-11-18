@@ -1,15 +1,17 @@
 use crate::app::App;
 use crate::draw::IconSize;
 use crate::layout::Rect;
+pub use crate::listing::Group;
 use crate::shell;
-use crate::theme::Color;
-use std::ops::Range;
+use crate::theme::{Color, ROW_H};
 
 /// Left/right padding of the grid inside the content area.
 pub const PAD: f32 = 12.0;
 pub const ICON_MIN: f32 = 48.0;
 pub const ICON_MAX: f32 = 128.0;
 pub const ICON_DEFAULT: f32 = 64.0;
+/// Height of a group's section header ("Today", "PDF Document", ...).
+pub const HEADER_H: f32 = 28.0;
 const NAME_H: f32 = 32.0; // two lines of 12 px text
 
 pub fn clamp_icon(size: f32) -> f32 {
@@ -24,13 +26,17 @@ pub enum Dir {
     Down,
 }
 
-/// Icon-view geometry for a content width and icon size. Cells are stretched to fill the row evenly.
-#[derive(Clone, Copy, Debug)]
+/// Item geometry for the icon view (many columns) and the list view (one column), with optional
+/// group sections. Items are indexes into the sorted entries; each group starts a new row under its header.
+#[derive(Clone, Debug)]
 pub struct Grid {
     pub cols: usize,
     pub cell_w: f32,
     pub cell_h: f32,
     pub icon: f32,
+    pad: f32,
+    /// Groups and the y of each group's header; empty means one group without a header.
+    groups: Vec<(Group, f32)>,
 }
 
 impl Grid {
@@ -38,77 +44,138 @@ impl Grid {
         let min_w = icon + 40.0;
         let usable = (width - 2.0 * PAD).max(min_w);
         let cols = ((usable / min_w).floor() as usize).max(1);
-        Grid { cols, cell_w: usable / cols as f32, cell_h: icon + 54.0, icon }
+        Grid { cols, cell_w: usable / cols as f32, cell_h: icon + 54.0, icon, pad: PAD, groups: Vec::new() }
     }
 
-    fn rows(&self, n: usize) -> usize {
-        n.div_ceil(self.cols)
+    /// One row per item, full width (list view).
+    pub fn list(width: f32) -> Grid {
+        Grid { cols: 1, cell_w: width, cell_h: ROW_H, icon: 16.0, pad: 0.0, groups: Vec::new() }
+    }
+
+    pub fn grouped(mut self, groups: Vec<Group>) -> Grid {
+        let mut y = 0.0;
+        self.groups = groups
+            .into_iter()
+            .map(|g| {
+                let top = y;
+                y += HEADER_H + self.rows(g.range.len()) as f32 * self.cell_h;
+                (g, top)
+            })
+            .collect();
+        self
+    }
+
+    fn rows(&self, len: usize) -> usize {
+        len.div_ceil(self.cols)
+    }
+
+    /// (first index, item count, y of the first row) for each group; one unlabeled group when ungrouped.
+    fn sections(&self, n: usize) -> Vec<(usize, usize, f32)> {
+        if self.groups.is_empty() {
+            return vec![(0, n, 0.0)];
+        }
+        self.groups.iter().map(|(g, top)| (g.range.start, g.range.len(), top + HEADER_H)).collect()
+    }
+
+    pub fn headers(&self, _n: usize) -> Vec<(String, f32)> {
+        self.groups.iter().map(|(g, top)| (g.label.clone(), *top)).collect()
     }
 
     pub fn content_h(&self, n: usize) -> f32 {
-        self.rows(n) as f32 * self.cell_h
+        self.sections(n).last().map_or(0.0, |&(_, len, y)| y + self.rows(len) as f32 * self.cell_h)
     }
 
     /// Cell rect relative to the grid origin (content top-left), before scrolling.
     pub fn cell(&self, i: usize) -> Rect {
-        Rect::new(PAD + (i % self.cols) as f32 * self.cell_w, (i / self.cols) as f32 * self.cell_h, self.cell_w, self.cell_h)
+        let (start, _, y) = self.sections(i + 1).into_iter().rev().find(|s| s.0 <= i).unwrap_or((0, 0, 0.0));
+        let k = i - start;
+        Rect::new(self.pad + (k % self.cols) as f32 * self.cell_w, y + (k / self.cols) as f32 * self.cell_h, self.cell_w, self.cell_h)
     }
 
     /// Item under a point given relative to the content top-left.
     pub fn cell_at(&self, x: f32, y: f32, scroll: f32, n: usize) -> Option<usize> {
-        if x < PAD || y < 0.0 {
+        if x < self.pad || y < 0.0 {
             return None;
         }
-        let col = ((x - PAD) / self.cell_w) as usize;
-        let row = ((y + scroll) / self.cell_h) as usize;
-        let i = row * self.cols + col;
-        (col < self.cols && i < n).then_some(i)
+        let y = y + scroll;
+        let (start, len, top) = self.sections(n).into_iter().rev().find(|s| s.2 - HEADER_H <= y || s.0 == 0)?;
+        if y < top {
+            return None; // on a header
+        }
+        let col = ((x - self.pad) / self.cell_w) as usize;
+        let k = ((y - top) / self.cell_h) as usize * self.cols + col;
+        (col < self.cols && k < len).then_some(start + k)
     }
 
-    pub fn visible(&self, scroll: f32, viewport_h: f32, n: usize) -> Range<usize> {
-        let first = (scroll.max(0.0) / self.cell_h) as usize * self.cols;
-        let last_row = ((scroll.max(0.0) + viewport_h) / self.cell_h).ceil() as usize;
-        first.min(n)..(last_row * self.cols).min(n)
+    /// Items with any part inside the vertical window [scroll, scroll + viewport_h).
+    pub fn visible(&self, scroll: f32, viewport_h: f32, n: usize) -> Vec<usize> {
+        let (lo, hi) = (scroll.max(0.0), scroll.max(0.0) + viewport_h);
+        let mut out = Vec::new();
+        for (start, len, top) in self.sections(n) {
+            let bottom = top + self.rows(len) as f32 * self.cell_h;
+            if bottom <= lo || top >= hi {
+                continue;
+            }
+            let r0 = ((lo - top).max(0.0) / self.cell_h) as usize;
+            let r1 = (((hi - top) / self.cell_h).ceil() as usize).min(self.rows(len));
+            out.extend((r0 * self.cols..(r1 * self.cols).min(len)).map(|k| start + k));
+        }
+        out
     }
 
     /// Items whose cell intersects `r` (grid coordinates, scroll included).
     pub fn cells_in(&self, r: Rect, n: usize) -> Vec<usize> {
-        let col = |x: f32| ((x - PAD) / self.cell_w).floor().clamp(0.0, self.cols as f32 - 1.0) as usize;
-        if r.right() <= PAD || r.x >= PAD + self.cols as f32 * self.cell_w || r.bottom() <= 0.0 {
-            return Vec::new();
-        }
-        let (c0, c1) = (col(r.x), col(r.right() - 0.01));
-        let (r0, r1) = ((r.y.max(0.0) / self.cell_h) as usize, ((r.bottom() - 0.01) / self.cell_h) as usize);
-        (r0..=r1).flat_map(|row| (c0..=c1).map(move |c| row * self.cols + c)).filter(|&i| i < n).collect()
+        self.visible(r.y, r.h.max(0.01), n)
+            .into_iter()
+            .filter(|&i| {
+                let c = self.cell(i);
+                c.x < r.right() && r.x < c.right() && c.y < r.bottom() && r.y < c.bottom()
+            })
+            .collect()
     }
 
-    /// Next focus for an arrow key. Moving down onto a short last row lands on the last item.
+    /// Next focus for an arrow key. Up/Down keep the column, clamped to shorter rows; they cross group boundaries.
     pub fn step(&self, cur: Option<usize>, d: Dir, n: usize) -> usize {
         let Some(c) = cur else { return 0 };
         if n == 0 {
             return 0;
         }
+        // Every visual row as (first index, length).
+        let rows: Vec<(usize, usize)> = self
+            .sections(n)
+            .into_iter()
+            .flat_map(|(start, len, _)| (0..self.rows(len)).map(move |r| (start + r * self.cols, (len - r * self.cols).min(self.cols))))
+            .collect();
+        let Some(ri) = rows.iter().position(|&(s, l)| c >= s && c < s + l) else { return c.min(n - 1) };
+        let col = c - rows[ri].0;
+        let to_row = |r: usize| rows[r].0 + col.min(rows[r].1 - 1);
         match d {
             Dir::Left => c.saturating_sub(1),
             Dir::Right => (c + 1).min(n - 1),
-            Dir::Up => c.checked_sub(self.cols).unwrap_or(c),
-            Dir::Down if c + self.cols < n => c + self.cols,
-            Dir::Down if c / self.cols < self.rows(n) - 1 => n - 1,
-            Dir::Down => c,
+            Dir::Up if ri > 0 => to_row(ri - 1),
+            Dir::Down if ri + 1 < rows.len() => to_row(ri + 1),
+            _ => c,
         }
     }
 
     /// Scroll offset that keeps item `i` fully visible.
     pub fn scroll_to_show(&self, i: usize, scroll: f32, viewport_h: f32) -> f32 {
-        let top = (i / self.cols) as f32 * self.cell_h;
-        if top < scroll {
-            top
-        } else if top + self.cell_h > scroll + viewport_h {
-            top + self.cell_h - viewport_h
+        let c = self.cell(i);
+        if c.y < scroll {
+            c.y
+        } else if c.bottom() > scroll + viewport_h {
+            c.bottom() - viewport_h
         } else {
             scroll
         }
     }
+}
+
+/// Section header: label on the left and a hairline under it.
+pub fn paint_header(app: &App, label: &str, r: Rect) {
+    let t = app.theme;
+    app.gfx.text(label, Rect::new(r.x + 12.0, r.y + 2.0, r.w - 24.0, r.h - 4.0), &app.gfx.fonts.title, t.text);
+    app.gfx.line(r.x + 12.0, r.bottom() - 0.5, r.right() - 12.0, r.bottom() - 0.5, t.separator);
 }
 
 /// Finder-style folder: a darker back with the tab, a lighter front panel.
@@ -129,6 +196,9 @@ pub fn paint(app: &mut App) {
     let n = app.list.entries.len();
     let scroll = app.list.scroll_y;
     app.gfx.push_clip(content);
+    for (label, y) in grid.headers(n) {
+        paint_header(app, &label, Rect::new(content.x, content.y + y - scroll, content.w, HEADER_H));
+    }
     for i in grid.visible(scroll, content.h, n) {
         let c = grid.cell(i);
         let cell = Rect::new(content.x + c.x, content.y + c.y - scroll, c.w, c.h);
@@ -202,9 +272,9 @@ mod tests {
     #[test]
     fn visible_range_covers_partial_rows() {
         let g = Grid::new(1000.0, 64.0);
-        assert_eq!(g.visible(0.0, g.cell_h * 2.0 + 1.0, 100), 0..27);
-        assert_eq!(g.visible(g.cell_h * 10.0, g.cell_h, 95), 90..95);
-        assert_eq!(g.visible(0.0, 500.0, 0), 0..0);
+        assert_eq!(g.visible(0.0, g.cell_h * 2.0 + 1.0, 100), (0..27).collect::<Vec<_>>());
+        assert_eq!(g.visible(g.cell_h * 10.0, g.cell_h, 95), (90..95).collect::<Vec<_>>());
+        assert!(g.visible(0.0, 500.0, 0).is_empty());
         assert_eq!(g.content_h(19), 3.0 * g.cell_h);
     }
 
@@ -236,6 +306,48 @@ mod tests {
         let past_end = Rect::new(PAD, g.cell_h * 2.2, g.cell_w * 9.0, 10.0);
         assert_eq!(g.cells_in(past_end, 20), [18, 19], "only existing items");
         assert!(g.cells_in(Rect::new(0.0, 0.0, 2.0, 2.0), 20).is_empty(), "padding touches nothing");
+    }
+
+    fn grouped() -> Grid {
+        // 9 columns; groups of 3 and 11 items, each with a header.
+        Grid::new(1000.0, 64.0).grouped(vec![Group { label: "A".into(), range: 0..3 }, Group { label: "B".into(), range: 3..14 }])
+    }
+
+    #[test]
+    fn groups_start_on_new_rows_under_headers() {
+        let g = grouped();
+        assert_eq!(g.cell(0).y, HEADER_H);
+        assert_eq!(g.cell(3).y, HEADER_H + g.cell_h + HEADER_H, "second group starts below the first group's row and its own header");
+        assert_eq!(g.cell(3).x, PAD, "and at the left edge");
+        assert_eq!(g.content_h(14), 2.0 * HEADER_H + 3.0 * g.cell_h);
+        let h = g.headers(14);
+        assert_eq!(h, [("A".to_string(), 0.0), ("B".to_string(), HEADER_H + g.cell_h)]);
+    }
+
+    #[test]
+    fn grouped_hits_skip_headers() {
+        let g = grouped();
+        assert_eq!(g.cell_at(PAD + 1.0, 2.0, 0.0, 14), None, "header row");
+        assert_eq!(g.cell_at(PAD + 1.0, HEADER_H + 2.0, 0.0, 14), Some(0));
+        assert_eq!(g.cell_at(PAD + g.cell_w * 4.0, HEADER_H + 2.0, 0.0, 14), None, "past the end of group A's row");
+        let b = g.cell(12);
+        assert_eq!(g.cell_at(b.x + 2.0, b.y + 2.0, 0.0, 14), Some(12));
+    }
+
+    #[test]
+    fn arrows_cross_groups_by_row() {
+        let g = grouped();
+        assert_eq!(g.step(Some(1), Dir::Down, 14), 4, "row of A -> first row of B, same column");
+        assert_eq!(g.step(Some(8), Dir::Up, 14), 2, "column clamps to the short row above");
+        assert_eq!(g.step(Some(13), Dir::Up, 14), 4);
+    }
+
+    #[test]
+    fn list_geometry_is_one_column() {
+        let g = Grid::list(500.0);
+        assert_eq!(g.cols, 1);
+        assert_eq!(g.cell(3).y, 3.0 * crate::theme::ROW_H);
+        assert_eq!(g.cell_at(10.0, crate::theme::ROW_H * 2.5, 0.0, 5), Some(2));
     }
 
     #[test]

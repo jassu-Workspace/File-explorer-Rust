@@ -55,6 +55,29 @@ pub fn read_folder(path: &Path, show_hidden: bool) -> io::Result<Vec<Entry>> {
     Ok(out)
 }
 
+/// A run of entries that share a group label (Finder's "Group by").
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Group {
+    pub label: String,
+    pub range: std::ops::Range<usize>,
+}
+
+/// Stable-sorts entries by `key` = (rank, label) and returns the contiguous groups.
+/// Order inside a group is the order the entries already had (the user's sort).
+pub fn group_entries(entries: &mut Vec<Entry>, mut key: impl FnMut(&Entry) -> (i64, String)) -> Vec<Group> {
+    let mut keyed: Vec<((i64, String), Entry)> = entries.drain(..).map(|e| (key(&e), e)).collect();
+    keyed.sort_by(|a, b| a.0.cmp(&b.0));
+    let mut groups: Vec<Group> = Vec::new();
+    for (i, (k, e)) in keyed.into_iter().enumerate() {
+        match groups.last_mut() {
+            Some(g) if g.label == k.1 => g.range.end = i + 1,
+            _ => groups.push(Group { label: k.1, range: i..i + 1 }),
+        }
+        entries.push(e);
+    }
+    groups
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum SortKey {
     Name,
@@ -233,6 +256,22 @@ mod tests {
         let mut v = vec![fake("b.txt", false, 0, 0), fake("a.pdf", false, 0, 0), fake("c.TXT", false, 0, 0)];
         sort_entries(&mut v, SortKey::Kind, false);
         assert_eq!(names(&v), ["a.pdf", "b.txt", "c.TXT"]);
+    }
+
+    #[test]
+    fn grouping_is_stable_and_contiguous() {
+        let mut v = vec![fake("b1", false, 0, 0), fake("a1", false, 0, 0), fake("b2", false, 0, 0), fake("a2", false, 0, 0)];
+        let groups = group_entries(&mut v, |e| (0, e.name.to_string_lossy()[..1].to_uppercase()));
+        assert_eq!(names(&v), ["a1", "a2", "b1", "b2"], "within a group the existing order stays");
+        assert_eq!(groups.iter().map(|g| (g.label.as_str(), g.range.clone())).collect::<Vec<_>>(), [("A", 0..2), ("B", 2..4)]);
+        assert!(group_entries(&mut Vec::new(), |_| (0, String::new())).is_empty());
+    }
+
+    #[test]
+    fn group_rank_beats_label() {
+        let mut v = vec![fake("x", false, 1, 0), fake("y", false, 2, 0)];
+        let groups = group_entries(&mut v, |e| (-(e.size as i64), format!("s{}", e.size)));
+        assert_eq!(groups[0].label, "s2");
     }
 
     #[test]

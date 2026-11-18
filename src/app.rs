@@ -48,6 +48,16 @@ const SCROLL_ANIM: Duration = Duration::from_millis(120);
 const HOVER_ANIM: Duration = Duration::from_millis(100);
 const COLUMN_ANIM: Duration = Duration::from_millis(150);
 
+/// Finder's "Group" button.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GroupBy {
+    None,
+    Kind,
+    Date,
+    Size,
+    Name,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum View {
     Icon,
@@ -118,6 +128,9 @@ pub struct App {
     band: Option<(f32, f32, Vec<usize>, f32, f32)>,
     /// Icon-view icon size in DIPs (Ctrl+Plus / Ctrl+Minus).
     pub icon_size: f32,
+    pub group_by: GroupBy,
+    /// Groups over `list.entries` for the current `group_by` (empty when not grouping).
+    pub groups: Vec<crate::listing::Group>,
     /// Gallery strip horizontal scroll.
     pub gallery_scroll: f32,
     thumbnailer: Option<crate::thumbs::Thumbnailer>,
@@ -380,7 +393,63 @@ impl App {
     }
 
     pub fn grid(&self) -> views::grid::Grid {
-        views::grid::Grid::new(self.layout.content.w, self.icon_size)
+        views::grid::Grid::new(self.layout.content.w, self.icon_size).grouped(self.groups.clone())
+    }
+
+    /// Row geometry of the list view (one column, with group headers when grouping).
+    pub fn list_grid(&self) -> views::grid::Grid {
+        views::grid::Grid::list(self.layout.rows.w).grouped(self.groups.clone())
+    }
+
+    /// Re-sorts entries into groups for `group_by`. Call after the entries or the sort change.
+    fn regroup(&mut self) {
+        if self.group_by == GroupBy::None {
+            self.groups.clear();
+            return;
+        }
+        let today = shell::now_local();
+        let by = self.group_by;
+        let names = &mut self.type_names;
+        let mut v = std::mem::take(&mut self.list.entries);
+        self.groups = crate::listing::group_entries(&mut v, |e| match by {
+            // Folders first, then kinds alphabetically.
+            GroupBy::Kind => (if e.is_dir() { -1 } else { 0 }, shell::type_name(e, names)),
+            GroupBy::Date => crate::format::date_group(shell::to_local(e.modified), today),
+            GroupBy::Size => {
+                let (rank, label) = crate::format::size_group(e.is_dir(), e.size);
+                (rank, label.to_string())
+            }
+            GroupBy::Name => {
+                let c = e.name.to_string_lossy().chars().next().map_or('#', |c| c.to_ascii_uppercase());
+                (0, if c.is_ascii_alphabetic() { c.to_string() } else { "#".to_string() })
+            }
+            GroupBy::None => (0, String::new()),
+        });
+        self.list.entries = v;
+    }
+
+    fn group_menu(&mut self, r: &ToolbarRects) {
+        let Some(at) = r.group else { return };
+        let mut pt = POINT { x: (at.x * self.scale) as i32, y: (at.bottom() * self.scale) as i32 };
+        let choices = [(GroupBy::None, w!("None")), (GroupBy::Kind, w!("Kind")), (GroupBy::Date, w!("Date Modified")), (GroupBy::Size, w!("Size")), (GroupBy::Name, w!("Name"))];
+        let cmd = unsafe {
+            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut pt);
+            let Ok(m) = CreatePopupMenu() else { return };
+            for (i, (g, text)) in choices.iter().enumerate() {
+                let checked = if *g == self.group_by { MF_CHECKED } else { MF_UNCHECKED };
+                let _ = AppendMenuW(m, MF_STRING | checked, i + 1, *text);
+            }
+            let cmd = TrackPopupMenu(m, TPM_RETURNCMD, pt.x, pt.y, None, self.hwnd, None);
+            let _ = DestroyMenu(m);
+            cmd.0 as usize
+        };
+        if let Some((g, _)) = cmd.checked_sub(1).and_then(|i| choices.get(i)) {
+            self.group_by = *g;
+            self.list.sel.clear();
+            self.regroup();
+            self.list.scroll_y = 0.0;
+            self.invalidate();
+        }
     }
 
     fn zoom_icons(&mut self, delta: f32) {
@@ -410,7 +479,7 @@ impl App {
         Some(match self.view {
             View::Icon => self.grid().cell_at(x - a.x, y - a.y, self.list.scroll_y, self.list.entries.len()),
             View::Gallery => views::gallery::strip_at(x - a.x, self.gallery_scroll, self.list.entries.len()).filter(|_| y - a.y >= 12.0),
-            _ => self.list.row_at(y - a.y),
+            _ => self.list_grid().cell_at(x - a.x, y - a.y, self.list.scroll_y, self.list.entries.len()),
         })
     }
 
@@ -427,7 +496,7 @@ impl App {
             return crate::layout::Rect::new(a.x + c.x + 4.0, a.y + c.y - self.list.scroll_y + 16.0 + g.icon, c.w - 8.0, 20.0);
         }
         let name_w = views::list::columns(a.w, self.list.show_where)[0].2;
-        let y = a.y + i as f32 * crate::theme::ROW_H - self.list.scroll_y;
+        let y = a.y + self.list_grid().cell(i).y - self.list.scroll_y;
         crate::layout::Rect::new(a.x + 32.0, y, name_w - 40.0, crate::theme::ROW_H)
     }
 
@@ -436,7 +505,7 @@ impl App {
         match self.view {
             View::Icon => (self.grid().content_h(self.list.entries.len()) - h).max(0.0),
             View::Gallery => 0.0,
-            _ => self.list.max_scroll(h),
+            _ => (self.list_grid().content_h(self.list.entries.len()) - h).max(0.0),
         }
     }
 
@@ -446,7 +515,7 @@ impl App {
         match self.view {
             View::Icon => self.list.scroll_y = self.grid().scroll_to_show(i, self.list.scroll_y, h),
             View::Gallery => self.gallery_scroll = views::gallery::strip_scroll_to_show(i, self.gallery_scroll, self.item_area().w),
-            _ => self.list.ensure_visible(i, h),
+            _ => self.list.scroll_y = self.list_grid().scroll_to_show(i, self.list.scroll_y, h),
         }
     }
 
@@ -608,6 +677,7 @@ impl App {
         if self.list.entries.len() < 50_000 {
             self.list.resort();
         }
+        self.regroup();
         self.invalidate();
     }
 
@@ -620,6 +690,7 @@ impl App {
         if self.list.entries.len() >= 50_000 {
             self.list.resort();
         }
+        self.regroup();
         self.invalidate();
     }
 
@@ -786,6 +857,7 @@ impl App {
                 self.error = None;
                 self.free = m.free;
                 self.list.set_entries(m.result.unwrap_or_default());
+                self.regroup();
                 if self.columns_view() {
                     let root = self.history.current().to_path_buf();
                     self.columns.open_root(root.clone());
@@ -891,6 +963,7 @@ impl App {
             let gone: Vec<bool> = self.list.entries.iter().map(|e| !self.entry_path(e).exists()).collect();
             let mut it = gone.into_iter();
             self.list.entries.retain(|_| !it.next().unwrap_or(false));
+            self.regroup();
             self.list.sel.clear();
             self.invalidate();
         }
@@ -1222,6 +1295,7 @@ impl App {
         } else if self.view == View::List && l.header.contains(x, y) {
             if let Some(c) = self.list.col_at(x - l.header.x, l.header.w) {
                 self.list.click_header(c);
+                self.regroup();
                 self.invalidate();
             }
         } else if self.view == View::Icon && self.item_at(x, y) == Some(None) {
@@ -1253,6 +1327,7 @@ impl App {
             Hot::View(2) => self.set_view(View::Columns),
             Hot::View(3) => self.set_view(View::Gallery),
             Hot::Search => self.focus_search(),
+            Hot::Group => self.group_menu(r),
             Hot::Action => {
                 // Same menu as right-click, anchored under the button.
                 let mut pt = POINT { x: (r.action.x * self.scale) as i32, y: (r.action.bottom() * self.scale) as i32 };
@@ -1744,6 +1819,8 @@ pub fn run() -> Result<()> {
             view: View::Icon,
             icon_size: views::grid::ICON_DEFAULT,
             band: None,
+            group_by: GroupBy::None,
+            groups: Vec::new(),
             gallery_scroll: 0.0,
             thumbnailer: None,
             thumb_pending: Default::default(),
