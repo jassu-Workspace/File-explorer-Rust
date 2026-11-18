@@ -22,6 +22,10 @@ impl Color {
     pub fn with_alpha(self, a: f32) -> Color {
         Color { a, ..self }
     }
+    /// Multiplies the alpha (keeps translucent theme colors translucent while fading).
+    pub fn fade(self, k: f32) -> Color {
+        Color { a: self.a * k, ..self }
+    }
     /// This color composited over an opaque background (for GDI, which has no alpha).
     pub fn over(self, bg: Color) -> Color {
         let m = |f: f32, b: f32| f * self.a + b * (1.0 - self.a);

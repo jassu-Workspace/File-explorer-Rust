@@ -6,6 +6,7 @@ pub mod pathbar;
 pub mod settings;
 pub mod sidebar;
 pub mod toolbar;
+pub mod transfer;
 
 use crate::app::App;
 use crate::layout::Rect;
@@ -42,6 +43,7 @@ pub fn paint(app: &mut App) {
         g.line(0.0, l.pathbar.y + 0.5, l.pathbar.w, l.pathbar.y + 0.5, t.separator);
         pathbar::paint(app);
     }
+    transfer::paint(app);
     if app.settings_open {
         settings::paint(app);
     }

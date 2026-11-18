@@ -185,8 +185,8 @@ use windows::Win32::System::DataExchange::{CloseClipboard, EmptyClipboard, GetCl
 use windows::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows::Win32::System::Ole::CF_HDROP;
 use windows::Win32::UI::Shell::{
-    DROPFILES, DragQueryFileW, FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_RENAMEONCOLLISION,
-    FOF_SILENT, FOFX_ADDUNDORECORD, FOFX_RECYCLEONDELETE, FileOperation, HDROP, IFileOperation, IShellItem, SHCreateItemFromParsingName,
+    DROPFILES, DragQueryFileW, FILEOPERATION_FLAGS, FOF_ALLOWUNDO, FOF_NOCONFIRMMKDIR, FOF_NOERRORUI, FOF_RENAMEONCOLLISION,
+    FOFX_ADDUNDORECORD, FileOperation, HDROP, IFileOperation, IShellItem, SHCreateItemFromParsingName,
     ShellExecuteW,
 };
 use windows::Win32::UI::WindowsAndMessaging::SW_SHOWNORMAL;
@@ -263,35 +263,6 @@ pub fn new_folder(hwnd: Option<HWND>, dir: &Path) -> windows::core::Result<PathB
     unsafe { op.NewItem(&item(dir)?, FILE_ATTRIBUTE_DIRECTORY.0, &HSTRING::from(name.as_str()), None, None)? };
     perform(&op)?;
     Ok(dir.join(name))
-}
-
-/// Recycles (or permanently deletes) `paths`. `confirm` shows the OS confirmation dialog.
-pub fn delete(hwnd: Option<HWND>, paths: &[PathBuf], permanent: bool, confirm: bool) -> windows::core::Result<()> {
-    let mut flags = if permanent { FOF_NOERRORUI } else { FOF_ALLOWUNDO | FOFX_RECYCLEONDELETE };
-    if !confirm {
-        flags |= FOF_NOCONFIRMATION | FOF_SILENT;
-    }
-    let op = file_op(hwnd, flags)?;
-    for p in paths {
-        unsafe { op.DeleteItem(&item(p)?, None)? };
-    }
-    perform(&op)
-}
-
-pub fn paste(hwnd: Option<HWND>, items: &[PathBuf], cut: bool, dest: &Path) -> windows::core::Result<()> {
-    let op = file_op(hwnd, FOF_ALLOWUNDO | FOF_RENAMEONCOLLISION)?;
-    let d = item(dest)?;
-    for p in items {
-        let i = item(p)?;
-        unsafe {
-            if cut {
-                op.MoveItem(&i, &d, None, None)?;
-            } else {
-                op.CopyItem(&i, &d, None, None)?;
-            }
-        }
-    }
-    perform(&op)
 }
 
 struct Clipboard;
@@ -522,16 +493,6 @@ mod action_tests {
     }
 
     #[test]
-    fn delete_permanent_removes() {
-        com();
-        let d = tmp("delete");
-        fs::write(d.join("gone.txt"), "x").unwrap();
-        delete(None, &[d.join("gone.txt")], true, false).unwrap();
-        assert!(!d.join("gone.txt").exists());
-        fs::remove_dir_all(d).unwrap();
-    }
-
-    #[test]
     #[ignore = "replaces the user's clipboard; run with --ignored"]
     fn clipboard_roundtrip() {
         let paths = vec![PathBuf::from(r"C:\a b\one.txt"), PathBuf::from(r"C:\two.txt")];
@@ -539,17 +500,5 @@ mod action_tests {
         assert_eq!(clipboard_get(None), Some((paths.clone(), true)));
         clipboard_put(None, &paths[..1], false).unwrap();
         assert_eq!(clipboard_get(None), Some((paths[..1].to_vec(), false)));
-    }
-
-    #[test]
-    fn paste_copy_into_dir() {
-        com();
-        let d = tmp("paste");
-        fs::create_dir(d.join("dest")).unwrap();
-        fs::write(d.join("a.txt"), "hello").unwrap();
-        paste(None, &[d.join("a.txt")], false, &d.join("dest")).unwrap();
-        assert_eq!(fs::read_to_string(d.join("dest").join("a.txt")).unwrap(), "hello");
-        assert!(d.join("a.txt").exists());
-        fs::remove_dir_all(d).unwrap();
     }
 }

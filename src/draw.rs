@@ -219,6 +219,8 @@ pub struct Gfx {
     /// Thumbnails, capped at 20 MB of pixels.
     thumbs: crate::thumbs::Lru<crate::thumbs::ThumbKey, ID2D1Bitmap>,
     wic: Option<IWICImagingFactory>,
+    /// Round line caps for rings and check marks.
+    round: Option<ID2D1StrokeStyle>,
     dpi: f32,
 }
 
@@ -251,11 +253,13 @@ impl Gfx {
                 f
             },
         };
+        let props = D2D1_STROKE_STYLE_PROPERTIES { startCap: D2D1_CAP_STYLE_ROUND, endCap: D2D1_CAP_STYLE_ROUND, lineJoin: D2D1_LINE_JOIN_ROUND, ..Default::default() };
+        let round = unsafe { factory.CreateStrokeStyle(&props, None) }.ok();
         let mut glyphs = HashMap::new();
         for g in ALL_GLYPHS {
             glyphs.insert(g, build_geometry(&factory, glyph_path(g))?);
         }
-        Ok(Gfx { factory, dw, fonts, glyphs, rt: None, brush: None, icons: HashMap::new(), thumbs: crate::thumbs::Lru::new(20 << 20), wic: None, dpi: 96.0 })
+        Ok(Gfx { factory, dw, fonts, glyphs, rt: None, brush: None, icons: HashMap::new(), thumbs: crate::thumbs::Lru::new(20 << 20), wic: None, round, dpi: 96.0 })
     }
 
     /// Creates the render target on first use or after device loss.
@@ -473,6 +477,77 @@ impl Gfx {
             let conv = wic.CreateFormatConverter()?;
             conv.Initialize(&src?, &GUID_WICPixelFormat32bppPBGRA, WICBitmapDitherTypeNone, None, 0.0, WICBitmapPaletteTypeMedianCut)?;
             rt.CreateBitmapFromWicBitmap(&conv, None)
+        }
+    }
+
+    pub fn set_transform(&self, m: Matrix3x2) {
+        if let Some(rt) = &self.rt {
+            unsafe { rt.SetTransform(&m) };
+        }
+    }
+
+    pub fn reset_transform(&self) {
+        self.set_transform(Matrix3x2::identity());
+    }
+
+    /// Ring segment from 12 o'clock, clockwise over `frac` of a turn, with round caps (progress rings).
+    pub fn arc(&self, cx: f32, cy: f32, r: f32, frac: f32, width: f32, c: Color) {
+        let Some((rt, b)) = self.brush(c) else { return };
+        let frac = frac.clamp(0.0, 1.0);
+        unsafe {
+            if frac >= 0.999 {
+                let e = D2D1_ELLIPSE { point: v(cx, cy), radiusX: r, radiusY: r };
+                rt.DrawEllipse(&e, b, width, None);
+                return;
+            }
+            if frac <= 0.0 {
+                return;
+            }
+            let Ok(geo) = self.factory.CreatePathGeometry() else { return };
+            let Ok(sink) = geo.Open() else { return };
+            let a = frac * std::f32::consts::TAU;
+            sink.BeginFigure(v(cx, cy - r), D2D1_FIGURE_BEGIN_HOLLOW);
+            sink.AddArc(&D2D1_ARC_SEGMENT {
+                point: v(cx + r * a.sin(), cy - r * a.cos()),
+                size: windows::Win32::Graphics::Direct2D::Common::D2D_SIZE_F { width: r, height: r },
+                rotationAngle: 0.0,
+                sweepDirection: D2D1_SWEEP_DIRECTION_CLOCKWISE,
+                arcSize: if frac > 0.5 { D2D1_ARC_SIZE_LARGE } else { D2D1_ARC_SIZE_SMALL },
+            });
+            sink.EndFigure(D2D1_FIGURE_END_OPEN);
+            if sink.Close().is_ok() {
+                rt.DrawGeometry(&geo, b, width, self.round.as_ref());
+            }
+        }
+    }
+
+    /// Filled closed polygon (the tapered Recycle Bin body).
+    pub fn fill_poly(&self, pts: &[(f32, f32)], c: Color) {
+        let (Some((rt, b)), Some(first)) = (self.brush(c), pts.first()) else { return };
+        unsafe {
+            let Ok(geo) = self.factory.CreatePathGeometry() else { return };
+            let Ok(sink) = geo.Open() else { return };
+            sink.BeginFigure(v(first.0, first.1), D2D1_FIGURE_BEGIN_FILLED);
+            for p in &pts[1..] {
+                sink.AddLine(v(p.0, p.1));
+            }
+            sink.EndFigure(D2D1_FIGURE_END_CLOSED);
+            if sink.Close().is_ok() {
+                rt.FillGeometry(&geo, b, None);
+            }
+        }
+    }
+
+    pub fn bitmap_alpha(&self, bmp: &ID2D1Bitmap, r: Rect, alpha: f32) {
+        if let Some(rt) = &self.rt {
+            unsafe { rt.DrawBitmap(bmp, Some(&rf(r)), alpha.clamp(0.0, 1.0), D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, None) };
+        }
+    }
+
+    /// A line with round caps (check marks).
+    pub fn stroke(&self, x1: f32, y1: f32, x2: f32, y2: f32, width: f32, c: Color) {
+        if let Some((rt, b)) = self.brush(c) {
+            unsafe { rt.DrawLine(v(x1, y1), v(x2, y2), b, width, self.round.as_ref()) };
         }
     }
 

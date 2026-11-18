@@ -8,6 +8,10 @@ use crate::shell;
 use crate::theme::Theme;
 use crate::views::list::{ListAction, ListView, Mods};
 use crate::views::sidebar::Sidebar;
+use crate::transfer::Op;
+use crate::views::transfer::Prompt;
+use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use crate::views::toolbar::{ToolbarRects, toolbar_rects};
 use crate::views::{self, pathbar};
 use std::collections::HashMap;
@@ -41,6 +45,7 @@ pub const WM_SEARCH_BATCH: u32 = WM_APP + 2;
 pub const WM_SEARCH_DONE: u32 = WM_APP + 3;
 pub const WM_COLUMN_DONE: u32 = WM_APP + 4;
 pub const WM_THUMB_DONE: u32 = WM_APP + 5;
+pub const WM_TRANSFER: u32 = WM_APP + 6;
 const ID_SEARCH_TIMER: usize = 1;
 const SEARCH_DEBOUNCE_MS: u32 = 150;
 const ID_ANIM_TIMER: usize = 2;
@@ -177,6 +182,8 @@ pub struct App {
     win_defaults: crate::settings::WinDefaults,
     pub settings_open: bool,
     sheet_anim: Option<crate::layout::Anim>,
+    /// Running transfers and their animations.
+    pub xfer: views::transfer::Transfers,
     /// Press on an item, for single-click open on release: (x, y, target, Ctrl/Shift held).
     press: Option<(f32, f32, PressTarget, bool)>,
     /// Item waiting for the hover-select timer (single-click mode).
@@ -374,7 +381,12 @@ impl App {
         if self.hover_anim.is_some_and(|a| a.done(now)) {
             self.hover_anim = None;
         }
-        if self.scroll_anim.is_none() && self.cols_anim.is_none() && self.hover_anim.is_none() && self.sheet_anim.is_none() {
+        self.xfer.cleanup(now);
+        let recycling = self.xfer.rows.iter().any(|r| r.op == crate::transfer::Op::Recycle && r.done.is_none());
+        if let Some(b) = self.xfer.bin.as_mut().filter(|b| b.landed.is_none() && !recycling && self.xfer.flights.is_empty()) {
+            b.landed = Some(now);
+        }
+        if self.scroll_anim.is_none() && self.cols_anim.is_none() && self.hover_anim.is_none() && self.sheet_anim.is_none() && !self.xfer.active() {
             unsafe {
                 let _ = KillTimer(Some(self.hwnd), ID_ANIM_TIMER);
             }
@@ -1285,46 +1297,247 @@ impl App {
 
     fn paste_here(&mut self) {
         let Some((items, cut)) = shell::clipboard_get(Some(self.hwnd)) else { return };
-        let dest = self.current_dir().to_path_buf();
-        let r = shell::paste(Some(self.hwnd), &items, cut, &dest);
-        if r.is_ok() && cut {
-            for item in &items {
-                if let Some(name) = item.file_name()
-                    && !item.exists()
-                    && dest.join(name).exists()
-                {
-                    self.tags.renamed(item, &dest.join(name));
-                }
-            }
-            let _ = self.tags.save();
+        if cut {
             // A moved file is gone from its source; a second paste must not try again.
             shell::clipboard_clear(Some(self.hwnd));
         }
-        self.report("Paste", r);
-        self.reload_current();
+        let dest = self.current_dir().to_path_buf();
+        self.start_transfer(if cut { Op::Move } else { Op::Copy }, items, Some(dest));
     }
 
     fn delete_selection(&mut self, permanent: bool) {
         let paths = self.selected_paths();
-        if paths.is_empty() {
-            return;
+        if !paths.is_empty() {
+            self.start_transfer(if permanent { Op::Delete } else { Op::Recycle }, paths, None);
         }
-        let r = shell::delete(Some(self.hwnd), &paths, permanent, true);
-        for p in paths.iter().filter(|p| !p.exists()) {
-            self.tags.deleted(p);
+    }
+
+    /// Starts a copy, move, recycle or delete in the custom transfer UI. Conflicts and permanent deletes ask first.
+    pub fn start_transfer(&mut self, op: Op, items: Vec<PathBuf>, dest: Option<PathBuf>) {
+        let shown = Instant::now();
+        if op == Op::Delete {
+            self.xfer.prompt = Some(Prompt::ConfirmDelete { items, shown });
+        } else if let Some(d) = dest.as_ref().filter(|_| matches!(op, Op::Copy | Op::Move)) {
+            let conflicts = crate::transfer::find_conflicts(&items, d, |p| std::fs::symlink_metadata(p).is_ok());
+            if conflicts.is_empty() {
+                return self.run_transfer(op, items, dest, &HashMap::new());
+            }
+            self.xfer.prompt = Some(Prompt::Conflict { op, items, dest: d.clone(), conflicts, idx: 0, answers: HashMap::new(), apply_all: false, shown });
+        } else {
+            return self.run_transfer(op, items, dest, &HashMap::new());
+        }
+        self.start_anim_timer();
+        self.invalidate();
+    }
+
+    fn run_transfer(&mut self, op: Op, items: Vec<PathBuf>, dest: Option<PathBuf>, answers: &HashMap<PathBuf, crate::transfer::Choice>) {
+        let job = match crate::transfer::build_job(op, &items, dest.as_deref(), answers) {
+            Ok(j) if !j.is_empty() => j,
+            Ok(_) => return,
+            Err(e) => {
+                self.error = Some(e);
+                return self.invalidate();
+            }
+        };
+        let now = Instant::now();
+        self.launch_flights(op, &items);
+        if op == Op::Recycle {
+            match self.xfer.bin.as_mut() {
+                Some(b) => b.landed = None,
+                None => self.xfer.bin = Some(views::transfer::Bin { shown: now, landed: None }),
+            }
+        }
+        let letter = |p: &Path| p.to_string_lossy().get(..2).map(str::to_uppercase);
+        let drives = dest.as_deref().and_then(|d| {
+            let (a, b) = (letter(items.first()?)?, letter(d)?);
+            (a != b).then_some((a, b))
+        });
+        self.xfer.next_id += 1;
+        let id = self.xfer.next_id;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.xfer.rows.push(views::transfer::Row {
+            id,
+            op,
+            dest_name: dest.as_deref().map(|d| folder_title(d, &self.sidebar.drives)).unwrap_or_default(),
+            progress: crate::transfer::Progress::new(job.count(), 0),
+            current: String::new(),
+            started: now,
+            failed: Vec::new(),
+            done: None,
+            cancel: cancel.clone(),
+            drives,
+            items,
+            dest,
+            shake_at: None,
+            flipped_at: None,
+        });
+        let send = self.send_hwnd();
+        std::thread::spawn(move || crate::transfer::run(job, cancel, move |u| send.post(WM_TRANSFER, Box::new((id, u)))));
+        self.start_anim_timer();
+        self.invalidate();
+    }
+
+    /// On-screen center of item `i`'s icon, when it is visible in the list or icon view.
+    fn item_point(&self, i: usize) -> Option<(f32, f32)> {
+        let a = self.item_area();
+        let (x, y) = match self.view {
+            View::Icon => {
+                let g = self.grid();
+                let c = g.cell(i);
+                (a.x + c.x + c.w / 2.0, a.y + c.y - self.list.scroll_y + self.icon_size / 2.0 + 8.0)
+            }
+            View::List => {
+                let c = self.list_grid().cell(i);
+                (a.x + 28.0, a.y + c.y - self.list.scroll_y + c.h / 2.0)
+            }
+            _ => return None,
+        };
+        a.contains(x, y).then_some((x, y))
+    }
+
+    /// Selected items lift off and arc to the Recycle Bin (recycle) or drop into the folder (paste).
+    fn launch_flights(&mut self, op: Op, items: &[PathBuf]) {
+        let content = self.layout.content;
+        let start = Instant::now();
+        let mut from: Vec<(PathBuf, (f32, f32))> = Vec::new();
+        if op == Op::Recycle && !self.columns_view() {
+            for i in self.list.sel.selected() {
+                if let (Some(e), Some(pt)) = (self.list.entries.get(i), self.item_point(i)) {
+                    from.push((self.entry_path(e), pt));
+                }
+            }
+        }
+        let to = match op {
+            Op::Recycle => views::transfer::bin_mouth(content),
+            _ => (content.x + content.w / 2.0, content.y + content.h / 2.0),
+        };
+        if from.is_empty() && op != Op::Delete {
+            // Nothing visible to lift: items come from the panel at the bottom.
+            let origin = (content.x + content.w / 2.0, content.bottom() - 40.0);
+            from = items.iter().take(6).map(|p| (p.clone(), if op == Op::Recycle { (content.x + content.w / 2.0, content.y + content.h / 2.0) } else { origin })).collect();
+        }
+        for (k, (path, pt)) in from.into_iter().take(12).enumerate() {
+            let is_dir = path.is_dir();
+            self.xfer.flights.push(views::transfer::Flight { path, is_dir, from: pt, to, start, delay: 0.12 + k as f32 * 0.06, dur: 0.55 });
+        }
+    }
+
+    fn on_transfer(&mut self, id: u64, u: crate::transfer::Update) {
+        use crate::transfer::Update;
+        let now = Instant::now();
+        let Some(row) = self.xfer.rows.iter_mut().find(|r| r.id == id) else { return };
+        match u {
+            Update::Started { items, bytes } => row.progress = crate::transfer::Progress::new(items, bytes),
+            Update::Progress { fraction, current } => {
+                row.progress.sample(now.duration_since(row.started).as_secs_f64(), fraction);
+                if !current.is_empty() && current != row.current {
+                    row.current = current;
+                    row.flipped_at = Some(now);
+                }
+            }
+            Update::Failed { path, message } => {
+                row.failed.push((path, message));
+                row.shake_at = Some(now);
+            }
+            Update::Done { cancelled } => {
+                row.done = Some((now, cancelled));
+                let (op, items, dest) = (row.op, row.items.clone(), row.dest.clone());
+                self.finish_transfer(op, &items, dest.as_deref(), cancelled);
+            }
+        }
+        self.start_anim_timer();
+        self.invalidate();
+    }
+
+    /// Keeps tags in step with moved or deleted files and reloads what is on screen.
+    fn finish_transfer(&mut self, op: Op, items: &[PathBuf], dest: Option<&Path>, cancelled: bool) {
+        let gone: Vec<&PathBuf> = items.iter().filter(|p| std::fs::symlink_metadata(p).is_err()).collect();
+        match (op, dest) {
+            (Op::Move, Some(d)) => {
+                for p in &gone {
+                    if let Some(name) = p.file_name().filter(|n| d.join(n).exists()) {
+                        self.tags.renamed(p, &d.join(name));
+                    }
+                }
+            }
+            (Op::Recycle | Op::Delete, _) => gone.iter().for_each(|p| self.tags.deleted(p)),
+            _ => {}
         }
         let _ = self.tags.save();
+        if op == Op::Recycle && !cancelled && !gone.is_empty() {
+            let n = gone.len();
+            let text = if n == 1 { format!("Moved “{}” to Recycle Bin", gone[0].file_name().unwrap_or_default().to_string_lossy()) } else { format!("Moved {n} items to Recycle Bin") };
+            self.xfer.toast = Some(views::transfer::Toast { text, shown: Instant::now(), undo: Vec::new() });
+        }
         if self.searching {
             // Keep the results; drop rows whose file is gone.
-            let gone: Vec<bool> = self.list.entries.iter().map(|e| !self.entry_path(e).exists()).collect();
+            let gone: Vec<bool> = self.list.entries.iter().map(|e| std::fs::symlink_metadata(self.entry_path(e)).is_err()).collect();
             let mut it = gone.into_iter();
             self.list.entries.retain(|_| !it.next().unwrap_or(false));
             self.regroup();
             self.list.sel.clear();
             self.invalidate();
         }
-        self.report("Delete", r);
         self.reload_current();
+    }
+
+    fn on_transfer_hit(&mut self, h: views::transfer::Hit) {
+        use views::transfer::{Hit, PromptButton as B};
+        match h {
+            Hit::Cancel(id) => {
+                if let Some(r) = self.xfer.rows.iter().find(|r| r.id == id) {
+                    r.cancel.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            Hit::Retry(id) | Hit::Skip(id) => {
+                let Some(r) = self.xfer.rows.iter_mut().find(|r| r.id == id) else { return };
+                let failed: Vec<PathBuf> = std::mem::take(&mut r.failed).into_iter().map(|f| f.0).collect();
+                let (op, dest) = (r.op, r.dest.clone());
+                if r.done.is_some() {
+                    r.done = Some((Instant::now() - Duration::from_secs(10), false)); // expire at once
+                }
+                if matches!(h, Hit::Retry(_)) {
+                    let retry: Vec<PathBuf> = failed.into_iter().filter(|p| std::fs::symlink_metadata(p).is_ok()).collect();
+                    if !retry.is_empty() {
+                        self.start_transfer(op, retry, dest);
+                    }
+                }
+            }
+            Hit::Prompt(b) => match self.xfer.prompt.take() {
+                Some(Prompt::ConfirmDelete { items, .. }) => {
+                    if b == B::Delete {
+                        self.run_transfer(Op::Delete, items, None, &HashMap::new());
+                    }
+                }
+                Some(Prompt::Conflict { op, items, dest, conflicts, mut idx, mut answers, mut apply_all, shown }) => {
+                    let choice = match b {
+                        B::Skip => Some(crate::transfer::Choice::Skip),
+                        B::KeepBoth => Some(crate::transfer::Choice::KeepBoth),
+                        B::Replace => Some(crate::transfer::Choice::Replace),
+                        _ => None,
+                    };
+                    match choice {
+                        None => apply_all = !apply_all,
+                        Some(c) => {
+                            let end = if apply_all { conflicts.len() } else { idx + 1 };
+                            for p in &conflicts[idx..end] {
+                                answers.insert(p.clone(), c);
+                            }
+                            idx = end;
+                        }
+                    }
+                    if idx >= conflicts.len() {
+                        self.run_transfer(op, items, Some(dest), &answers);
+                    } else {
+                        self.xfer.prompt = Some(Prompt::Conflict { op, items, dest, conflicts, idx, answers, apply_all, shown });
+                    }
+                }
+                None => {}
+            },
+            Hit::PromptCard | Hit::Row | Hit::Undo => {}
+        }
+        self.start_anim_timer();
+        self.invalidate();
     }
 
     fn create_folder(&mut self) {
@@ -1646,6 +1859,9 @@ impl App {
     }
 
     fn on_left_down(&mut self, x: f32, y: f32) {
+        if let Some(h) = views::transfer::hit(self, x, y) {
+            return self.on_transfer_hit(h);
+        }
         if self.settings_open {
             let window = crate::layout::Rect::new(0.0, 0.0, self.w, self.h);
             match views::settings::sheet_hit(window, x, y) {
@@ -1758,6 +1974,10 @@ impl App {
             0x4E if mods().ctrl && mods().shift => self.create_folder(), // Ctrl+Shift+N
             v if v == VK_F2.0 => self.start_rename(),
             v if v == VK_DELETE.0 => self.delete_selection(mods().shift),
+            v if v == VK_ESCAPE.0 && self.xfer.prompt.is_some() => {
+                self.xfer.prompt = None;
+                self.invalidate();
+            }
             v if v == VK_ESCAPE.0 && self.settings_open => {
                 self.settings_open = false;
                 self.invalidate();
@@ -1874,6 +2094,12 @@ impl App {
             WM_SEARCH_DONE => {
                 let m = unsafe { Box::from_raw(lp.0 as *mut (u64, search::SearchStats)) };
                 self.on_search_done(m.0, m.1);
+                Some(LRESULT(0))
+            }
+            WM_TRANSFER => {
+                let m = unsafe { Box::from_raw(lp.0 as *mut (u64, crate::transfer::Update)) };
+                let (id, u) = *m;
+                self.on_transfer(id, u);
                 Some(LRESULT(0))
             }
             WM_THUMB_DONE => {
@@ -2314,6 +2540,7 @@ pub fn run() -> Result<()> {
             win_defaults: crate::settings::read_windows(),
             settings_open: false,
             sheet_anim: None,
+            xfer: Default::default(),
             press: None,
             hover_pending: None,
             type_names: HashMap::new(),

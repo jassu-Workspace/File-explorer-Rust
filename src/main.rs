@@ -6,6 +6,7 @@ mod edit;
 mod format;
 mod layout;
 mod listing;
+mod motion;
 mod nav;
 mod prefs;
 mod search;
@@ -16,6 +17,7 @@ mod shell;
 mod theme;
 mod tags;
 mod thumbs;
+mod transfer;
 mod views;
 
 use windows::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
