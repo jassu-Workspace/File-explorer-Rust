@@ -13,7 +13,7 @@ use windows::Win32::System::Com::CoTaskMemFree;
 use windows::Win32::System::SystemInformation::GetLocalTime;
 use windows::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows::Win32::UI::Shell::{
-    FOLDERID_CommonPrograms, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_Recent,
+    FOLDERID_CommonPrograms, FOLDERID_Programs, FOLDERID_Desktop, FOLDERID_Documents, FOLDERID_Downloads, FOLDERID_Pictures, FOLDERID_Profile, FOLDERID_Recent,
     FOLDERID_SkyDrive, KF_FLAG_DEFAULT, SHFILEINFOW, SHGFI_FLAGS,
     SHGFI_SMALLICON, SHGFI_SYSICONINDEX, SHGFI_TYPENAME, SHGFI_USEFILEATTRIBUTES, SHGetFileInfoW, SHGetKnownFolderPath,
 };
@@ -55,7 +55,6 @@ pub fn home() -> Option<PathBuf> {
 pub fn favorites() -> Vec<Place> {
     places(&[
         ("Recents", &FOLDERID_Recent, Glyph::Clock),
-        // shortcut: all-users Start menu only; per-user app shortcuts live in FOLDERID_Programs. Merge both when a virtual folder exists.
         ("Applications", &FOLDERID_CommonPrograms, Glyph::Grid),
         ("Desktop", &FOLDERID_Desktop, Glyph::Desktop),
         ("Documents", &FOLDERID_Documents, Glyph::Doc),
@@ -70,6 +69,11 @@ pub const RECYCLE_BIN: &str = "shell:RecycleBinFolder";
 
 pub fn is_recycle_bin(p: &Path) -> bool {
     p.as_os_str() == RECYCLE_BIN
+}
+
+/// A second folder shown merged into `path`: Applications lists the all-users and the per-user Start menu apps.
+pub fn merged_with(path: &Path) -> Option<PathBuf> {
+    (known(&FOLDERID_CommonPrograms).as_deref() == Some(path)).then(|| known(&FOLDERID_Programs)).flatten()
 }
 
 /// Cloud-synced roots (iCloud's place in Finder).

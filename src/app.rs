@@ -203,8 +203,12 @@ pub struct App {
     edit_brush: HBRUSH,
     pub search_edit: HWND,
     rename_edit: HWND,
-    /// Row being renamed (list view).
+    /// Row being renamed (list, icon and gallery views).
     renaming: Option<usize>,
+    /// (column, row) being renamed in the column view.
+    renaming_col: Option<(usize, usize)>,
+    /// Sidebar tag whose label is being edited.
+    renaming_tag: Option<crate::tags::Tag>,
     /// After a reload, select this name and start renaming it (new folder).
     pending_rename: Option<std::ffi::OsString>,
     /// After a reload, select this name (Show in Folder).
@@ -262,7 +266,7 @@ impl App {
     }
     pub fn title(&self) -> String {
         match self.tag_view {
-            Some(t) => t.name().to_string(),
+            Some(t) => self.sidebar.tag_label(t).to_string(),
             None => folder_title(self.current_dir(), &self.sidebar.drives),
         }
     }
@@ -294,7 +298,7 @@ impl App {
         self.view = v;
         let key = self.history.current().to_string_lossy().into_owned();
         self.prefs.set(&key, view_name(v));
-        let _ = self.prefs.save();
+        self.saved(self.prefs.save());
         if v == View::Columns {
             let root = self.history.current().to_path_buf();
             self.columns.open_root(root.clone());
@@ -500,7 +504,7 @@ impl App {
             let on = !paths.is_empty() && paths.iter().all(|p| self.tags.of(p).contains(&tag));
             let flags = MF_STRING | if on { MF_CHECKED } else { MF_UNCHECKED } | if paths.is_empty() { MF_GRAYED } else { MF_ENABLED };
             unsafe {
-                let _ = AppendMenuW(m, flags, TAG_CMD + k, &windows::core::HSTRING::from(tag.name()));
+                let _ = AppendMenuW(m, flags, TAG_CMD + k, &windows::core::HSTRING::from(self.sidebar.tag_label(tag)));
             }
         }
         Some(m)
@@ -615,7 +619,7 @@ impl App {
             }
             Action::UseWindows => {
                 crate::settings::reset_to_windows(&mut self.prefs);
-                let _ = self.prefs.save();
+                self.saved(self.prefs.save());
                 self.apply_settings();
             }
             Action::Done => self.settings_open = false,
@@ -722,7 +726,7 @@ impl App {
     fn toggle_pathbar(&mut self) {
         self.show_pathbar = !self.show_pathbar;
         self.prefs.set("@pathbar", if self.show_pathbar { "1" } else { "0" });
-        let _ = self.prefs.save();
+        self.saved(self.prefs.save());
         self.relayout();
         self.invalidate();
     }
@@ -823,7 +827,7 @@ impl App {
         let a = self.item_area();
         if self.view == View::Gallery {
             let r = views::gallery::strip_item(i, self.gallery_scroll);
-            return crate::layout::Rect::new(a.x + r.x, a.y + 12.0, r.w, r.h);
+            return crate::layout::Rect::new(a.x + r.x, a.y + 12.0 + r.h - 24.0, r.w, 24.0);
         }
         if self.view == View::Icon {
             let g = self.grid();
@@ -1186,7 +1190,12 @@ impl App {
         self.thumb_pending.clear();
         self.thumb_exts.reset();
         std::thread::spawn(move || {
-            let result = read_folder(&path, |a| settings.visible(a));
+            let result = read_folder(&path, |a| settings.visible(a)).map(|mut v| {
+                if let Some(extra) = shell::merged_with(&path) {
+                    crate::listing::merge_folder(&mut v, read_folder(&extra, |a| settings.visible(a)).unwrap_or_default(), &extra);
+                }
+                v
+            });
             // Off the UI thread: GetDiskFreeSpaceEx can stall on network shares.
             let free = shell::free_space(&path);
             hwnd.post(WM_LISTING_DONE, Box::new(ListingMsg { generation, path, kind, result, free }));
@@ -1534,7 +1543,7 @@ impl App {
             (Op::Recycle | Op::Delete, _) => gone.iter().for_each(|p| self.tags.deleted(p)),
             _ => {}
         }
-        let _ = self.tags.save();
+        self.saved(self.tags.save());
         if op == Op::Recycle && !cancelled && !gone.is_empty() {
             let n = gone.len();
             let text = if n == 1 { format!("Moved “{}” to Recycle Bin", gone[0].file_name().unwrap_or_default().to_string_lossy()) } else { format!("Moved {n} items to Recycle Bin") };
@@ -1673,7 +1682,7 @@ impl App {
         }
         let v = pins.iter().map(|p| p.to_string_lossy()).collect::<Vec<_>>().join("|");
         self.prefs.set("@pins", &v);
-        let _ = self.prefs.save();
+        self.saved(self.prefs.save());
         self.sidebar.set_pins(&pins);
         self.invalidate();
     }
@@ -1698,8 +1707,16 @@ impl App {
         }
         let v = views::list::OPTIONAL.into_iter().filter(|c| self.list.shown.contains(c)).map(|c| c.title()).collect::<Vec<_>>().join(",");
         self.prefs.set("@cols", &v);
-        let _ = self.prefs.save();
+        self.saved(self.prefs.save());
         self.invalidate();
+    }
+
+    /// Shows a failed save of tags or settings instead of losing it silently.
+    fn saved(&mut self, r: std::io::Result<()>) {
+        if let Err(e) = r {
+            self.error = Some(format!("Couldn’t save your settings: {e}"));
+            self.invalidate();
+        }
     }
 
     fn copy_as_path(&mut self) {
@@ -1774,7 +1791,18 @@ impl App {
 
     /// Inline rename over the focused row's name (list view).
     fn start_rename(&mut self) {
-        if self.columns_view() || self.view == View::Gallery {
+        if self.columns_view() {
+            let fc = self.columns.focus_col;
+            let Some(c) = self.columns.cols.get(fc) else { return };
+            let Some((row, e)) = c.selected.and_then(|r| Some((r, c.entries.as_ref()?.get(r)?))) else { return };
+            let name = e.name.to_string_lossy().into_owned();
+            let stem_len = if e.is_dir() { name.encode_utf16().count() } else { Path::new(&name).file_stem().map_or(0, |s| s.to_string_lossy().encode_utf16().count()) };
+            let r = views::columns::row_name_rect(self, fc, row);
+            self.renaming_col = Some((fc, row));
+            edit::set_text(self.rename_edit, &name);
+            edit::show_in(self.rename_edit, r, self.scale);
+            edit::focus_select(self.rename_edit, 0, stem_len);
+            self.invalidate();
             return;
         }
         let Some(i) = self.list.sel.focus().filter(|&i| i < self.list.entries.len()) else { return };
@@ -1794,7 +1822,7 @@ impl App {
     }
 
     fn cancel_rename(&mut self) {
-        if self.renaming.take().is_some() {
+        if self.renaming.take().is_some() || self.renaming_col.take().is_some() || self.renaming_tag.take().is_some() {
             edit::hide(self.rename_edit);
             unsafe {
                 let _ = SetFocus(Some(self.hwnd));
@@ -1804,6 +1832,22 @@ impl App {
     }
 
     fn commit_rename(&mut self) {
+        if let Some((col, row)) = self.renaming_col.take() {
+            return self.commit_column_rename(col, row);
+        }
+        if let Some(tag) = self.renaming_tag.take() {
+            let label = tag.clean_label(&edit::text(self.rename_edit));
+            edit::hide(self.rename_edit);
+            unsafe {
+                let _ = SetFocus(Some(self.hwnd));
+            }
+            if let Some(k) = crate::tags::Tag::ALL.iter().position(|&t| t == tag) {
+                self.sidebar.tag_labels[k] = label.clone();
+            }
+            self.prefs.set(&format!("@tag.{}", tag.name()), &label);
+            self.saved(self.prefs.save());
+            return self.invalidate();
+        }
         let Some(i) = self.renaming.take() else { return };
         let new_name = edit::text(self.rename_edit).trim().to_string();
         edit::hide(self.rename_edit);
@@ -1825,7 +1869,7 @@ impl App {
         if r.is_ok() {
             if let Some(parent) = path.parent() {
                 self.tags.renamed(&path, &parent.join(&new_name));
-                let _ = self.tags.save();
+                self.saved(self.tags.save());
                 self.undo.push(crate::undo::Change::Moved(vec![(path.clone(), parent.join(&new_name))]));
             }
             self.list.entries[i].name = new_name.clone().into();
@@ -1833,6 +1877,39 @@ impl App {
         }
         self.report("Rename", r);
         self.reload_current();
+        self.invalidate();
+    }
+
+    fn commit_column_rename(&mut self, col: usize, row: usize) {
+        let new_name = edit::text(self.rename_edit).trim().to_string();
+        edit::hide(self.rename_edit);
+        unsafe {
+            let _ = SetFocus(Some(self.hwnd));
+        }
+        let Some(c) = self.columns.cols.get(col) else { return };
+        let Some(e) = c.entries.as_ref().and_then(|v| v.get(row)) else { return };
+        if new_name == e.name.to_string_lossy() {
+            return self.invalidate();
+        }
+        if let Err(m) = shell::validate_name(&new_name) {
+            self.error = Some(m.to_string());
+            return self.invalidate();
+        }
+        let (dir, path) = (c.path.clone(), c.path.join(&e.name));
+        let r = shell::rename(Some(self.hwnd), &path, &new_name);
+        if r.is_ok() {
+            self.tags.renamed(&path, &dir.join(&new_name));
+            self.saved(self.tags.save());
+            self.undo.push(crate::undo::Change::Moved(vec![(path, dir.join(&new_name))]));
+            // Reload the column; folders opened to its right belonged to the old name.
+            self.columns.cols.truncate(col + 1);
+            if let Some(c) = self.columns.cols.get_mut(col) {
+                c.selected = None;
+                c.entries = None;
+            }
+            self.load_column(dir);
+        }
+        self.report("Rename", r);
         self.invalidate();
     }
 
@@ -1871,6 +1948,12 @@ impl App {
                 let _ = ScreenToClient(self.hwnd, &mut pt);
             }
             let (x, y) = (pt.x as f32 / self.scale, pt.y as f32 / self.scale);
+            if self.layout.sidebar.contains(x, y) {
+                if let Some(i) = self.sidebar.hit(x, y, self.layout.sidebar) {
+                    self.sidebar_menu(i, screen);
+                }
+                return;
+            }
             if self.columns_view() {
                 if let Some((col, Some(row))) = views::columns::hit(self, x, y) {
                     if self.columns.cols[col].selected != Some(row) {
@@ -1888,27 +1971,48 @@ impl App {
                 }
             } else if self.view == View::List && self.layout.header.contains(x, y) {
                 return self.column_menu(screen);
-            } else if let Some(i) = self.sidebar.hit(x, y, self.layout.sidebar) {
-                let path = self.sidebar.place(i).map(|p| p.path.clone());
-                if let Some(p) = path.filter(|p| self.pins().contains(p)) {
-                    let cmd = unsafe {
-                        let Ok(m) = CreatePopupMenu() else { return };
-                        let _ = AppendMenuW(m, MF_STRING, 1, w!("Unpin from Favorites"));
-                        let c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, None, self.hwnd, None);
-                        let _ = DestroyMenu(m);
-                        c.0
-                    };
-                    if cmd == 1 {
-                        self.set_pin(&p, false);
-                    }
-                }
-                return;
             } else if !self.layout.content.contains(x, y) {
                 return;
             }
         }
         self.invalidate();
         self.context_menu(screen, on_item);
+    }
+
+    /// Right-click on a sidebar item: rename a tag, or unpin a pinned folder.
+    fn sidebar_menu(&mut self, i: usize, screen: POINT) {
+        if let Some(tag) = self.sidebar.tag_at(i) {
+            let cmd = unsafe {
+                let Ok(m) = CreatePopupMenu() else { return };
+                let _ = AppendMenuW(m, MF_STRING, 1, w!("Rename tag…"));
+                let c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, None, self.hwnd, None);
+                let _ = DestroyMenu(m);
+                c.0
+            };
+            if cmd == 1
+                && let Some(r) = self.sidebar.item_rects(self.layout.sidebar).into_iter().find(|s| s.0 == i).map(|s| s.1)
+            {
+                let label = self.sidebar.tag_label(tag).to_string();
+                self.renaming_tag = Some(tag);
+                edit::set_text(self.rename_edit, &label);
+                edit::show_in(self.rename_edit, crate::layout::Rect::new(r.x + 28.0, r.y + 2.0, r.w - 32.0, r.h - 4.0), self.scale);
+                edit::focus_select(self.rename_edit, 0, label.encode_utf16().count());
+            }
+            return;
+        }
+        let path = self.sidebar.place(i).map(|p| p.path.clone());
+        if let Some(p) = path.filter(|p| self.pins().contains(p)) {
+            let cmd = unsafe {
+                let Ok(m) = CreatePopupMenu() else { return };
+                let _ = AppendMenuW(m, MF_STRING, 1, w!("Unpin from Favorites"));
+                let c = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, None, self.hwnd, None);
+                let _ = DestroyMenu(m);
+                c.0
+            };
+            if cmd == 1 {
+                self.set_pin(&p, false);
+            }
+        }
     }
 
     /// Right-click menu. `on_item` is false for empty space.
@@ -1955,7 +2059,7 @@ impl App {
                     add(SHOW, w!("Show in Folder"), MF_ENABLED);
                 }
                 let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
-                add(RENAME, w!("Rename\tF2"), if self.columns_view() { MF_GRAYED } else { MF_ENABLED });
+                add(RENAME, w!("Rename\tF2"), MF_ENABLED);
                 add(COPY, w!("Copy\tCtrl+C"), MF_ENABLED);
                 add(CUT, w!("Cut\tCtrl+X"), MF_ENABLED);
                 add(COPY_PATH, w!("Copy as path\tCtrl+Shift+C"), MF_ENABLED);
@@ -2119,6 +2223,7 @@ impl App {
         unsafe {
             let _ = DwmSetWindowAttribute(self.hwnd, DWMWA_USE_IMMERSIVE_DARK_MODE, &dark as *const _ as _, 4);
         }
+        menu_theme(self.theme.dark);
     }
 
     fn hot_at(&self, x: f32, y: f32) -> Hot {
@@ -2684,6 +2789,16 @@ impl App {
             WM_SYSKEYDOWN => self.on_sys_key(wp.0 as u16).then_some(LRESULT(0)),
             WM_CHAR => {
                 let ch = char::from_u32(wp.0 as u32).filter(|c| !c.is_control())?;
+                if self.columns_view() {
+                    // Type-to-select in the focused column.
+                    let fc = self.columns.focus_col;
+                    let prefix = self.list.type_ahead.push(ch, Instant::now()).to_string();
+                    let hit = self.columns.cols.get(fc).and_then(|c| crate::selection::find_prefix(c.entries.as_ref()?.iter().map(|e| e.name.as_os_str()), &prefix));
+                    if let Some(row) = hit {
+                        self.column_select(fc, row);
+                    }
+                    return Some(LRESULT(0));
+                }
                 let a = self.list.on_char(ch, Instant::now());
                 self.handle_list_action(a);
                 Some(LRESULT(0))
@@ -2771,6 +2886,24 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
             return r;
         }
         DefWindowProcW(hwnd, msg, wp, lp)
+    }
+}
+
+/// Popup menus in dark or light to match the window.
+/// shortcut: uses uxtheme's unnamed exports SetPreferredAppMode (#135) and FlushMenuThemes (#136), which Explorer
+/// itself relies on; they are looked up at run time and skipped if absent. Switch to a public API if Windows adds one.
+fn menu_theme(dark: bool) {
+    use windows::Win32::System::LibraryLoader::{GetProcAddress, LoadLibraryW};
+    unsafe {
+        let Ok(lib) = LoadLibraryW(w!("uxtheme.dll")) else { return };
+        if let Some(f) = GetProcAddress(lib, windows::core::PCSTR(135 as *const u8)) {
+            let set: extern "system" fn(i32) -> i32 = std::mem::transmute(f);
+            set(if dark { 2 } else { 3 }); // ForceDark / ForceLight
+        }
+        if let Some(f) = GetProcAddress(lib, windows::core::PCSTR(136 as *const u8)) {
+            let flush: extern "system" fn() = std::mem::transmute(f);
+            flush();
+        }
     }
 }
 
@@ -2899,6 +3032,8 @@ pub fn run() -> Result<()> {
             search_edit: edit::create(hwnd, ID_SEARCH)?,
             rename_edit: edit::create(hwnd, ID_RENAME)?,
             renaming: None,
+            renaming_col: None,
+            renaming_tag: None,
             pending_rename: None,
             pending_select: None,
             search: None,
@@ -2921,6 +3056,11 @@ pub fn run() -> Result<()> {
         app.show_pathbar = app.prefs.get("@pathbar") == Some("1");
         app.settings = crate::settings::Settings::resolve(app.win_defaults, &app.prefs);
         let pins = app.pins();
+        for (k, t) in crate::tags::Tag::ALL.into_iter().enumerate() {
+            if let Some(v) = app.prefs.get(&format!("@tag.{}", t.name())) {
+                app.sidebar.tag_labels[k] = t.clean_label(v);
+            }
+        }
         if let Some(v) = app.prefs.get("@cols") {
             app.list.shown = views::list::OPTIONAL.into_iter().filter(|c| v.split(',').any(|t| t == c.title())).collect();
         }

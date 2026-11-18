@@ -15,6 +15,8 @@ pub struct Sidebar {
     pub cloud: Vec<Place>,
     pub drives: Vec<Place>,
     pub tags: Vec<crate::tags::Tag>,
+    /// User labels for the tags, in `Tag::ALL` order.
+    pub tag_labels: Vec<String>,
     /// Item under the mouse (index across all sections).
     pub hover: Option<usize>,
     pub hover_header: Option<usize>,
@@ -51,7 +53,12 @@ pub fn locations() -> Vec<Place> {
 
 impl Sidebar {
     pub fn load() -> Sidebar {
-        Sidebar { favorites: shell::favorites(), cloud: shell::cloud(), drives: locations(), tags: crate::tags::Tag::ALL.to_vec(), ..Default::default() }
+        let tag_labels = crate::tags::Tag::ALL.iter().map(|t| t.name().to_string()).collect();
+        Sidebar { favorites: shell::favorites(), cloud: shell::cloud(), drives: locations(), tags: crate::tags::Tag::ALL.to_vec(), tag_labels, ..Default::default() }
+    }
+
+    pub fn tag_label(&self, t: crate::tags::Tag) -> &str {
+        crate::tags::Tag::ALL.iter().position(|&x| x == t).and_then(|i| self.tag_labels.get(i)).map_or(t.name(), String::as_str)
     }
 
     /// Favorites = the standard places, then the user's pinned folders.
@@ -160,7 +167,7 @@ pub fn paint(app: &App) {
                 g.fill_round(r, 6.0, t.hover);
             }
             g.fill_round(Rect::new(r.x + 11.0, r.y + 9.0, 10.0, 10.0), 5.0, crate::theme::Color::rgb(tag.rgb()));
-            g.text(tag.name(), Rect::new(r.x + 32.0, r.y, r.w - 38.0, r.h), &g.fonts.body, t.text);
+            g.text(s.tag_label(tag), Rect::new(r.x + 32.0, r.y, r.w - 38.0, r.h), &g.fonts.body, t.text);
             continue;
         }
         let Some(p) = s.place(i) else { continue };

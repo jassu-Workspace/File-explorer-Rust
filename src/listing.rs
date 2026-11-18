@@ -16,7 +16,8 @@ pub struct Entry {
     /// FILETIME ticks of creation.
     pub created: u64,
     pub attrs: u32,
-    /// Parent folder relative to the search root; `None` for plain listings.
+    /// Parent folder relative to the search root, or an absolute folder (Recents, merged folders); `None` for
+    /// plain listings.
     pub rel_dir: Option<PathBuf>,
 }
 
@@ -121,6 +122,14 @@ fn trim_zeros(d: &[u8]) -> &[u8] {
 }
 
 /// Folders always come first; ties break by natural name.
+/// Adds the entries of a second folder to a listing (they keep their own folder for opening).
+pub fn merge_folder(into: &mut Vec<Entry>, extra: Vec<Entry>, dir: &Path) {
+    into.extend(extra.into_iter().map(|mut e| {
+        e.rel_dir = Some(dir.to_path_buf());
+        e
+    }));
+}
+
 pub fn sort_entries(entries: &mut [Entry], key: SortKey, descending: bool) {
     // Lowercase each name once; comparing allocated keys per call is too slow for 100k rows.
     let names: Vec<String> = entries.iter().map(|e| e.name.to_string_lossy().to_lowercase()).collect();
@@ -157,6 +166,16 @@ pub fn sort_entries(entries: &mut [Entry], key: SortKey, descending: bool) {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn merged_entries_keep_their_folder() {
+        let e = |n: &str| Entry { name: n.into(), size: 0, modified: 0, created: 0, attrs: 0x20, rel_dir: None };
+        let mut v = vec![e("a.lnk")];
+        merge_folder(&mut v, vec![e("b.lnk")], Path::new(r"C:\Users\me\Programs"));
+        assert_eq!(v[0].rel_dir, None);
+        assert_eq!(v[1].rel_dir.as_deref(), Some(Path::new(r"C:\Users\me\Programs")));
+    }
+
     use super::*;
 
     use std::fs;

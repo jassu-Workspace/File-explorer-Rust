@@ -42,6 +42,13 @@ impl Tag {
         }
     }
 
+    /// A user's label for this tag: trimmed, one line, at most 40 characters; empty gives the color name back.
+    pub fn clean_label(self, input: &str) -> String {
+        let one_line: String = input.chars().filter(|c| !c.is_control()).collect();
+        let s: String = one_line.trim().chars().take(40).collect();
+        if s.is_empty() { self.name().to_string() } else { s }
+    }
+
     fn parse(s: &str) -> Option<Tag> {
         Tag::ALL.into_iter().find(|t| t.name() == s)
     }
@@ -152,6 +159,15 @@ impl Tags {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn tag_labels_are_cleaned() {
+        assert_eq!(Tag::Red.clean_label("  Work  "), "Work");
+        assert_eq!(Tag::Red.clean_label(""), "Red", "empty resets to the color");
+        assert_eq!(Tag::Blue.clean_label("a\tb\nc"), "abc", "no tabs or line breaks (prefs are tab separated)");
+        assert_eq!(Tag::Gray.clean_label(&"x".repeat(60)).len(), 40);
+    }
+
     use super::*;
     use std::path::{Path, PathBuf};
 

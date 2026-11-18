@@ -29,6 +29,13 @@ fn col_rect(app: &App, i: usize) -> Rect {
     Rect::new(c.x + i as f32 * COLUMN_W - app.columns.scroll_x, c.y, COLUMN_W, c.h)
 }
 
+/// Name area of a row, for the rename box.
+pub fn row_name_rect(app: &App, col: usize, row: usize) -> Rect {
+    let c = col_rect(app, col);
+    let y = c.y + row as f32 * ROW_H - app.columns.cols.get(col).map_or(0.0, |k| k.scroll_y);
+    Rect::new(c.x + 30.0, y, c.w - 40.0, ROW_H)
+}
+
 /// (column, row) under the point; row is `None` for empty space in the column.
 pub fn hit(app: &App, x: f32, y: f32) -> Option<(usize, Option<usize>)> {
     if !app.layout.content.contains(x, y) {
