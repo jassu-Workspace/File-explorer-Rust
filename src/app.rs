@@ -147,6 +147,7 @@ pub struct App {
     thumb_pending: std::collections::HashSet<crate::thumbs::ThumbKey>,
     /// Files Windows has no thumbnail for; not asked again.
     thumb_none: std::collections::HashSet<crate::thumbs::ThumbKey>,
+    thumb_exts: crate::thumbs::ExtLearner,
     pub columns: Columns,
     pub error: Option<String>,
     pub loading: bool,
@@ -379,7 +380,8 @@ impl App {
         if let Some(b) = self.gfx.thumb(&key) {
             return Some(b);
         }
-        if !self.thumb_none.contains(&key) && self.thumb_pending.insert(key.clone()) {
+        let ext = key.0.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        if self.thumb_exts.should_request(&ext) && !self.thumb_none.contains(&key) && self.thumb_pending.insert(key.clone()) {
             if self.thumbnailer.is_none() {
                 self.thumbnailer = Some(crate::thumbs::Thumbnailer::start(self.send_hwnd()));
             }
@@ -393,6 +395,8 @@ impl App {
     fn on_thumb(&mut self, d: crate::thumbs::ThumbDone) {
         let current = self.thumbnailer.as_ref().is_some_and(|t| t.is_current(d.generation));
         self.thumb_pending.remove(&d.key);
+        let ext = d.key.0.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+        self.thumb_exts.record(&ext, d.bitmap.is_some());
         match d.bitmap {
             Some((h, alpha)) if current => {
                 self.gfx.add_thumb(d.key, h, alpha);
@@ -967,6 +971,7 @@ impl App {
             t.new_generation();
         }
         self.thumb_pending.clear();
+        self.thumb_exts.reset();
         std::thread::spawn(move || {
             let result = read_folder(&path, show_hidden);
             // Off the UI thread: GetDiskFreeSpaceEx can stall on network shares.
@@ -2035,6 +2040,7 @@ pub fn run() -> Result<()> {
             thumbnailer: None,
             thumb_pending: Default::default(),
             thumb_none: Default::default(),
+            thumb_exts: Default::default(),
             columns: Columns::default(),
             error: None,
             loading: false,

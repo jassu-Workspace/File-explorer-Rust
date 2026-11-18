@@ -75,6 +75,30 @@ pub fn has_alpha(bgra: &[u8]) -> bool {
 
 pub type ThumbKey = (PathBuf, u32);
 
+/// Learns, per file extension, whether Windows has thumbnails for it, so types like .txt stop costing a
+/// shell round trip for every file. Reset when the folder changes.
+#[derive(Default)]
+pub struct ExtLearner {
+    seen: HashMap<String, (u32, u32)>, // (successes, failures)
+}
+
+impl ExtLearner {
+    const GIVE_UP_AFTER: u32 = 3;
+
+    pub fn should_request(&self, ext: &str) -> bool {
+        self.seen.get(ext).is_none_or(|&(ok, fail)| ok > 0 || fail < Self::GIVE_UP_AFTER)
+    }
+
+    pub fn record(&mut self, ext: &str, ok: bool) {
+        let e = self.seen.entry(ext.to_string()).or_default();
+        if ok { e.0 += 1 } else { e.1 += 1 }
+    }
+
+    pub fn reset(&mut self) {
+        self.seen.clear();
+    }
+}
+
 /// Result posted to the UI thread. `bitmap` is an HBITMAP handle (owned by the receiver) and whether it has alpha.
 pub struct ThumbDone {
     pub generation: u64,
@@ -179,6 +203,23 @@ mod tests {
         assert_eq!(bucket(65.0), 128);
         assert_eq!(bucket(200.0), 256);
         assert_eq!(bucket(900.0), 512);
+    }
+
+    #[test]
+    fn stops_asking_for_types_that_never_have_thumbnails() {
+        let mut l = ExtLearner::default();
+        assert!(l.should_request("txt"));
+        for _ in 0..3 {
+            l.record("txt", false);
+        }
+        assert!(!l.should_request("txt"), "three failures and no success");
+        l.record("jpg", false);
+        l.record("jpg", false);
+        l.record("jpg", true);
+        l.record("jpg", false);
+        assert!(l.should_request("jpg"), "one success keeps the type alive");
+        l.reset();
+        assert!(l.should_request("txt"));
     }
 
     #[test]
