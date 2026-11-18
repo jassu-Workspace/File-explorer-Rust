@@ -7,6 +7,7 @@ mod format;
 mod layout;
 mod listing;
 mod nav;
+mod prefs;
 mod search;
 mod selection;
 mod share;

@@ -81,6 +81,15 @@ pub fn compute_layout(w: f32, h: f32, sidebar_w: f32, scale: f32) -> Layout {
     }
 }
 
+/// Gives the path bar's strip back to the sidebar and content (Finder hides the path bar by default).
+pub fn hide_pathbar(l: &mut Layout, h: f32) {
+    let grow = l.pathbar.h;
+    l.pathbar = Rect::new(l.pathbar.x, h, l.pathbar.w, 0.0);
+    for r in [&mut l.sidebar, &mut l.splitter, &mut l.content, &mut l.rows] {
+        r.h += grow;
+    }
+}
+
 pub fn visible_rows(scroll_y: f32, viewport_h: f32, row_h: f32, count: usize) -> Range<usize> {
     if count == 0 || row_h <= 0.0 {
         return 0..0;
@@ -248,5 +257,21 @@ mod anim_tests {
         let a = Anim::new(0.0, 5.0, Duration::ZERO, t0);
         assert_eq!(a.value(t0), 5.0);
         assert!(a.done(t0));
+    }
+}
+
+#[cfg(test)]
+mod pathbar_tests {
+    use super::*;
+
+    #[test]
+    fn hidden_pathbar_gives_space_back() {
+        let mut l = compute_layout(1200.0, 800.0, 200.0, 1.0);
+        hide_pathbar(&mut l, 800.0);
+        assert_eq!(l.pathbar.h, 0.0);
+        assert_eq!(l.pathbar.y, 800.0);
+        assert_eq!(l.content.bottom(), 800.0);
+        assert_eq!(l.rows.bottom(), 800.0);
+        assert_eq!(l.sidebar.bottom(), 800.0);
     }
 }

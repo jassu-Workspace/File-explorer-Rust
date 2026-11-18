@@ -27,7 +27,7 @@ use windows::Win32::UI::Controls::{MARGINS, WM_MOUSELEAVE};
 use windows::Win32::UI::HiDpi::{GetDpiForWindow, GetSystemMetricsForDpi};
 use windows::Win32::UI::Input::KeyboardAndMouse::{
     GetKeyState, ReleaseCapture, SetCapture, SetFocus, TME_LEAVE, TME_NONCLIENT, TRACKMOUSEEVENT, TrackMouseEvent, VK_BACK, VK_CONTROL, VK_ESCAPE,
-    VK_DELETE, VK_DOWN, VK_F2, VK_F5, VK_LEFT, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
+    VK_DELETE, VK_DOWN, VK_F2, VK_F5, VK_LEFT, VK_MENU, VK_RETURN, VK_RIGHT, VK_SHIFT, VK_UP,
 };
 use windows::Win32::UI::WindowsAndMessaging::*;
 use windows::core::{BOOL, PCWSTR, Result, w};
@@ -132,6 +132,10 @@ pub struct App {
     pub icon_size: f32,
     pub group_by: GroupBy,
     pub tags: crate::tags::Tags,
+    prefs: crate::prefs::Prefs,
+    pub show_pathbar: bool,
+    /// The list sort was switched to newest-first for Recents and goes back to Name when leaving it.
+    recents_sort: bool,
     share: Option<crate::share::Share>,
     /// Set while the list shows the files of one sidebar tag.
     pub tag_view: Option<crate::tags::Tag>,
@@ -246,6 +250,9 @@ impl App {
             return;
         }
         self.view = v;
+        let key = self.history.current().to_string_lossy().into_owned();
+        self.prefs.set(&key, view_name(v));
+        let _ = self.prefs.save();
         if v == View::Columns {
             let root = self.history.current().to_path_buf();
             self.columns.open_root(root.clone());
@@ -488,6 +495,24 @@ impl App {
             c.0 as usize
         };
         self.apply_tag_cmd(cmd);
+    }
+
+    fn saved_view(&self, folder: &Path) -> Option<View> {
+        match self.prefs.get(&folder.to_string_lossy())? {
+            "icon" => Some(View::Icon),
+            "list" => Some(View::List),
+            "columns" => Some(View::Columns),
+            "gallery" => Some(View::Gallery),
+            _ => None,
+        }
+    }
+
+    fn toggle_pathbar(&mut self) {
+        self.show_pathbar = !self.show_pathbar;
+        self.prefs.set("@pathbar", if self.show_pathbar { "1" } else { "0" });
+        let _ = self.prefs.save();
+        self.relayout();
+        self.invalidate();
     }
 
     pub fn grid(&self) -> views::grid::Grid {
@@ -958,8 +983,27 @@ impl App {
             Outcome::Loaded => {
                 self.error = None;
                 self.free = m.free;
-                self.list.set_entries(m.result.unwrap_or_default());
+                let here = self.history.current().to_path_buf();
+                if m.kind != NavKind::Refresh
+                    && let Some(v) = self.saved_view(&here)
+                {
+                    self.view = v;
+                }
+                let mut entries = m.result.unwrap_or_default();
+                let recents = self.sidebar.favorites.iter().any(|p| p.name == "Recents" && p.path == here);
+                if recents {
+                    // Windows keeps jump-list data folders in Recent; Explorer hides them, so do we.
+                    entries.retain(|e| !(e.is_dir() && (e.name == "AutomaticDestinations" || e.name == "CustomDestinations")));
+                    self.list.sort = (crate::listing::SortKey::Modified, true);
+                    self.recents_sort = true;
+                } else if std::mem::take(&mut self.recents_sort) {
+                    self.list.sort = (crate::listing::SortKey::Name, false);
+                }
+                self.list.set_entries(entries);
                 self.regroup();
+                if self.view == View::Gallery && !self.list.entries.is_empty() {
+                    self.list.sel.click(0);
+                }
                 if self.columns_view() {
                     let root = self.history.current().to_path_buf();
                     self.columns.open_root(root.clone());
@@ -1234,6 +1278,7 @@ impl App {
         const PASTE: usize = 7;
         const NEW_FOLDER: usize = 8;
         const HIDDEN: usize = 9;
+        const PATHBAR: usize = 10;
         let can_paste = shell::clipboard_get(Some(self.hwnd)).is_some();
         let cmd = unsafe {
             let Ok(m) = CreatePopupMenu() else { return };
@@ -1259,6 +1304,7 @@ impl App {
                 add(NEW_FOLDER, w!("New Folder\tCtrl+Shift+N"), if self.searching { MF_GRAYED } else { MF_ENABLED });
                 let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
                 add(HIDDEN, w!("Show Hidden Files"), if self.show_hidden { MF_CHECKED } else { MF_UNCHECKED });
+                add(PATHBAR, w!("Show Path Bar\tCtrl+Alt+P"), if self.show_pathbar { MF_CHECKED } else { MF_UNCHECKED });
             }
             let cmd = TrackPopupMenu(m, TPM_RETURNCMD | TPM_RIGHTBUTTON, screen.x, screen.y, None, self.hwnd, None);
             let _ = DestroyMenu(m);
@@ -1293,6 +1339,7 @@ impl App {
                 self.show_hidden = !self.show_hidden;
                 self.reload_current();
             }
+            PATHBAR => self.toggle_pathbar(),
             c => {
                 self.apply_tag_cmd(c);
             }
@@ -1334,6 +1381,9 @@ impl App {
 
     fn relayout(&mut self) {
         self.layout = compute_layout(self.w, self.h, self.sidebar_w, 1.0);
+        if !self.show_pathbar {
+            layout::hide_pathbar(&mut self.layout, self.h);
+        }
         self.list.scroll_y = self.list.scroll_y.min(self.max_scroll());
     }
 
@@ -1476,6 +1526,7 @@ impl App {
             v if v == VK_BACK.0 => self.go_back(),
             0x4C if mods().ctrl => self.show_address(), // Ctrl+L
             0x46 if mods().ctrl => self.focus_search(), // Ctrl+F
+            0x50 if mods().ctrl && key_down(VK_MENU.0) => self.toggle_pathbar(), // Ctrl+Alt+P
             0x43 if mods().ctrl => self.copy_selection(false), // Ctrl+C
             0x58 if mods().ctrl => self.copy_selection(true),  // Ctrl+X
             0x56 if mods().ctrl => self.paste_here(),           // Ctrl+V
@@ -1883,6 +1934,15 @@ extern "system" fn wndproc(hwnd: HWND, msg: u32, wp: WPARAM, lp: LPARAM) -> LRES
     }
 }
 
+fn view_name(v: View) -> &'static str {
+    match v {
+        View::Icon => "icon",
+        View::List => "list",
+        View::Columns => "columns",
+        View::Gallery => "gallery",
+    }
+}
+
 fn animations_enabled() -> bool {
     let mut on = BOOL::from(true);
     let ok = unsafe { SystemParametersInfoW(SPI_GETCLIENTAREAANIMATION, 0, Some(&mut on as *mut BOOL as _), SYSTEM_PARAMETERS_INFO_UPDATE_FLAGS(0)) };
@@ -1950,6 +2010,9 @@ pub fn run() -> Result<()> {
             band: None,
             group_by: GroupBy::None,
             tags: crate::tags::Tags::load(),
+            prefs: crate::prefs::Prefs::load(),
+            show_pathbar: false,
+            recents_sort: false,
             share: None,
             tag_view: None,
             groups: Vec::new(),
@@ -1990,6 +2053,7 @@ pub fn run() -> Result<()> {
             tracking: false,
         });
         app.apply_theme_to_frame();
+        app.show_pathbar = app.prefs.get("@pathbar") == Some("1");
         app.rebuild_edit_style();
         app.navigate(start, NavKind::Refresh);
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
