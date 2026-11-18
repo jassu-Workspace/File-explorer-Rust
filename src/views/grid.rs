@@ -171,6 +171,15 @@ impl Grid {
     }
 }
 
+/// Finder-style overlapping tag dots starting at `x`, vertically centered on `cy`.
+pub fn paint_tag_dots(app: &App, tags: &[crate::tags::Tag], x: f32, cy: f32) {
+    for (k, tag) in tags.iter().enumerate() {
+        let r = Rect::new(x + k as f32 * 6.0, cy - 4.5, 9.0, 9.0);
+        app.gfx.fill_round(Rect::new(r.x - 1.0, r.y - 1.0, r.w + 2.0, r.h + 2.0), 5.5, app.theme.content_bg);
+        app.gfx.fill_round(r, 4.5, Color::rgb(tag.rgb()));
+    }
+}
+
 /// Section header: label on the left and a hairline under it.
 pub fn paint_header(app: &App, label: &str, r: Rect) {
     let t = app.theme;
@@ -226,6 +235,12 @@ pub fn paint(app: &mut App) {
         }
         let name = shell::display_name(&app.list.entries[i]);
         let text = Rect::new(cell.x + 4.0, icon.bottom() + 8.0, cell.w - 8.0, NAME_H);
+        let tags = app.tags.of(&app.entry_path(&app.list.entries[i]));
+        if !tags.is_empty() {
+            let (w, _) = app.gfx.measure_box(&name, &app.gfx.fonts.cell, text.w, text.h);
+            let x = text.x + (text.w - w) / 2.0 - 8.0 - 6.0 * tags.len() as f32;
+            paint_tag_dots(app, &tags, x.max(cell.x), text.y + 8.0);
+        }
         let fg = if selected {
             let (w, h) = app.gfx.measure_box(&name, &app.gfx.fonts.cell, text.w, text.h);
             let pill = Rect::new(text.x + (text.w - w) / 2.0 - 4.0, text.y - 1.0, w + 8.0, h + 2.0);

@@ -11,6 +11,7 @@ mod search;
 mod selection;
 mod shell;
 mod theme;
+mod tags;
 mod thumbs;
 mod views;
 

@@ -242,6 +242,9 @@ pub fn paint(app: &mut App) {
                     }
                     let name = shell::display_name(e);
                     app.gfx.text(&name, Rect::new(cell.x + 24.0, y, cell.w - 24.0, ROW_H), &app.gfx.fonts.body, fg);
+                    let tags = app.tags.of(&app.entry_path(e));
+                    let after = cell.x + 24.0 + app.gfx.measure(&name, &app.gfx.fonts.body).min(cell.w - 60.0) + 6.0;
+                    crate::views::grid::paint_tag_dots(app, &tags, after, y + ROW_H / 2.0);
                 }
                 Col::Modified => {
                     let s = format_modified(shell::to_local(e.modified), today);

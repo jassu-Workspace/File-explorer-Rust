@@ -44,6 +44,8 @@ pub const WM_THUMB_DONE: u32 = WM_APP + 5;
 const ID_SEARCH_TIMER: usize = 1;
 const SEARCH_DEBOUNCE_MS: u32 = 150;
 const ID_ANIM_TIMER: usize = 2;
+/// Menu ids 100..107 are the seven color tags.
+const TAG_CMD: usize = 100;
 const SCROLL_ANIM: Duration = Duration::from_millis(120);
 const HOVER_ANIM: Duration = Duration::from_millis(100);
 const COLUMN_ANIM: Duration = Duration::from_millis(150);
@@ -129,6 +131,9 @@ pub struct App {
     /// Icon-view icon size in DIPs (Ctrl+Plus / Ctrl+Minus).
     pub icon_size: f32,
     pub group_by: GroupBy,
+    pub tags: crate::tags::Tags,
+    /// Set while the list shows the files of one sidebar tag.
+    pub tag_view: Option<crate::tags::Tag>,
     /// Groups over `list.entries` for the current `group_by` (empty when not grouping).
     pub groups: Vec<crate::listing::Group>,
     /// Gallery strip horizontal scroll.
@@ -209,7 +214,10 @@ impl App {
         self.history.can_forward()
     }
     pub fn title(&self) -> String {
-        folder_title(self.current_dir(), &self.sidebar.drives)
+        match self.tag_view {
+            Some(t) => t.name().to_string(),
+            None => folder_title(self.current_dir(), &self.sidebar.drives),
+        }
     }
     pub fn columns_view(&self) -> bool {
         self.view == View::Columns
@@ -390,6 +398,75 @@ impl App {
                 self.thumb_none.insert(d.key);
             }
         }
+    }
+
+    /// Lists every file with `tag` (search-style results with a Where column).
+    fn show_tag(&mut self, tag: crate::tags::Tag) {
+        use std::os::windows::fs::MetadataExt;
+        if !self.searching {
+            self.pre_search_view = self.view;
+        }
+        self.clear_search_field();
+        self.search = None;
+        self.searching = true;
+        self.search_running = false;
+        self.search_skipped = 0;
+        self.search_root = PathBuf::new(); // results carry absolute folders in rel_dir
+        self.tag_view = Some(tag);
+        self.view = View::List;
+        self.columns = Columns::default();
+        self.list.show_where = true;
+        self.error = None;
+        let entries = self
+            .tags
+            .files(tag)
+            .into_iter()
+            .filter_map(|p| {
+                let m = std::fs::symlink_metadata(&p).ok()?;
+                Some(Entry { name: p.file_name()?.to_os_string(), size: m.file_size(), modified: m.last_write_time(), attrs: m.file_attributes(), rel_dir: p.parent().map(Path::to_path_buf) })
+            })
+            .collect();
+        self.list.set_entries(entries);
+        self.regroup();
+        self.invalidate();
+    }
+
+    /// Menu of the seven color tags, checked when every selected item has the tag. Item ids are 100 + tag index.
+    fn tag_menu(&self) -> Option<HMENU> {
+        let paths = self.selected_paths();
+        let m = unsafe { CreatePopupMenu().ok()? };
+        for (k, tag) in crate::tags::Tag::ALL.into_iter().enumerate() {
+            let on = !paths.is_empty() && paths.iter().all(|p| self.tags.of(p).contains(&tag));
+            let flags = MF_STRING | if on { MF_CHECKED } else { MF_UNCHECKED } | if paths.is_empty() { MF_GRAYED } else { MF_ENABLED };
+            unsafe {
+                let _ = AppendMenuW(m, flags, TAG_CMD + k, &windows::core::HSTRING::from(tag.name()));
+            }
+        }
+        Some(m)
+    }
+
+    /// Applies a menu command from `tag_menu`.
+    fn apply_tag_cmd(&mut self, cmd: usize) -> bool {
+        let Some(tag) = cmd.checked_sub(TAG_CMD).and_then(|k| crate::tags::Tag::ALL.get(k).copied()) else { return false };
+        let paths = self.selected_paths();
+        self.tags.toggle(&paths, tag);
+        let r = self.tags.save().map_err(windows::core::Error::from);
+        self.report("Saving tags", r);
+        self.invalidate();
+        true
+    }
+
+    fn tags_button(&mut self, r: &ToolbarRects) {
+        let Some(at) = r.tags else { return };
+        let mut pt = POINT { x: (at.x * self.scale) as i32, y: (at.bottom() * self.scale) as i32 };
+        let Some(m) = self.tag_menu() else { return };
+        let cmd = unsafe {
+            let _ = windows::Win32::Graphics::Gdi::ClientToScreen(self.hwnd, &mut pt);
+            let c = TrackPopupMenu(m, TPM_RETURNCMD, pt.x, pt.y, None, self.hwnd, None);
+            let _ = DestroyMenu(m);
+            c.0 as usize
+        };
+        self.apply_tag_cmd(cmd);
     }
 
     pub fn grid(&self) -> views::grid::Grid {
@@ -613,6 +690,9 @@ impl App {
 
     /// "Where" column text: the result's folder, starting with the searched folder's name.
     pub fn where_label(&self, e: &Entry) -> String {
+        if self.tag_view.is_some() {
+            return e.rel_dir.as_ref().map(|p| p.display().to_string()).unwrap_or_default();
+        }
         let root = folder_title(&self.search_root, &self.sidebar.drives);
         match e.rel_dir.as_deref().filter(|p| !p.as_os_str().is_empty()) {
             Some(rel) => format!("{root}\\{}", rel.display()),
@@ -696,6 +776,7 @@ impl App {
 
     /// Leaves search mode. `reload` restores the folder listing and the view used before searching.
     fn end_search(&mut self, reload: bool) {
+        self.tag_view = None;
         let was = self.searching;
         self.search = None;
         self.searching = false;
@@ -945,6 +1026,15 @@ impl App {
         let dest = self.current_dir().to_path_buf();
         let r = shell::paste(Some(self.hwnd), &items, cut, &dest);
         if r.is_ok() && cut {
+            for item in &items {
+                if let Some(name) = item.file_name()
+                    && !item.exists()
+                    && dest.join(name).exists()
+                {
+                    self.tags.renamed(item, &dest.join(name));
+                }
+            }
+            let _ = self.tags.save();
             // A moved file is gone from its source; a second paste must not try again.
             shell::clipboard_clear(Some(self.hwnd));
         }
@@ -958,6 +1048,10 @@ impl App {
             return;
         }
         let r = shell::delete(Some(self.hwnd), &paths, permanent, true);
+        for p in paths.iter().filter(|p| !p.exists()) {
+            self.tags.deleted(p);
+        }
+        let _ = self.tags.save();
         if self.searching {
             // Keep the results; drop rows whose file is gone.
             let gone: Vec<bool> = self.list.entries.iter().map(|e| !self.entry_path(e).exists()).collect();
@@ -1038,6 +1132,10 @@ impl App {
         let path = self.entry_path(e);
         let r = shell::rename(Some(self.hwnd), &path, &new_name);
         if r.is_ok() {
+            if let Some(parent) = path.parent() {
+                self.tags.renamed(&path, &parent.join(&new_name));
+                let _ = self.tags.save();
+            }
             self.list.entries[i].name = new_name.clone().into();
             self.pending_select = Some(new_name.into());
         }
@@ -1131,6 +1229,10 @@ impl App {
                 add(COPY, w!("Copy\tCtrl+C"), MF_ENABLED);
                 add(CUT, w!("Cut\tCtrl+X"), MF_ENABLED);
                 add(DELETE, w!("Delete\tDel"), MF_ENABLED);
+                let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
+                if let Some(sub) = self.tag_menu() {
+                    let _ = AppendMenuW(m, MF_POPUP, sub.0 as usize, w!("Tags"));
+                }
             } else {
                 add(PASTE, w!("Paste\tCtrl+V"), if can_paste && !self.searching { MF_ENABLED } else { MF_GRAYED });
                 add(NEW_FOLDER, w!("New Folder\tCtrl+Shift+N"), if self.searching { MF_GRAYED } else { MF_ENABLED });
@@ -1170,7 +1272,9 @@ impl App {
                 self.show_hidden = !self.show_hidden;
                 self.reload_current();
             }
-            _ => {}
+            c => {
+                self.apply_tag_cmd(c);
+            }
         }
     }
 
@@ -1277,7 +1381,9 @@ impl App {
             self.sidebar.collapsed[s] = !self.sidebar.collapsed[s];
             self.invalidate();
         } else if let Some(i) = self.sidebar.hit(x, y, l.sidebar) {
-            if let Some(p) = self.sidebar.place(i) {
+            if let Some(tag) = self.sidebar.tag_at(i) {
+                self.show_tag(tag);
+            } else if let Some(p) = self.sidebar.place(i) {
                 self.navigate(p.path.clone(), NavKind::Visit);
             }
         } else if let Some(p) = pathbar::hit(self, x, y) {
@@ -1328,6 +1434,7 @@ impl App {
             Hot::View(3) => self.set_view(View::Gallery),
             Hot::Search => self.focus_search(),
             Hot::Group => self.group_menu(r),
+            Hot::Tags => self.tags_button(r),
             Hot::Action => {
                 // Same menu as right-click, anchored under the button.
                 let mut pt = POINT { x: (r.action.x * self.scale) as i32, y: (r.action.bottom() * self.scale) as i32 };
@@ -1820,6 +1927,8 @@ pub fn run() -> Result<()> {
             icon_size: views::grid::ICON_DEFAULT,
             band: None,
             group_by: GroupBy::None,
+            tags: crate::tags::Tags::load(),
+            tag_view: None,
             groups: Vec::new(),
             gallery_scroll: 0.0,
             thumbnailer: None,

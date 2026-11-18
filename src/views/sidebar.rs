@@ -7,17 +7,18 @@ use std::path::{Component, Path};
 const HEADER_H: f32 = 28.0;
 const ITEM_H: f32 = 28.0;
 const SECTION_GAP: f32 = 12.0;
-pub const SECTIONS: [&str; 3] = ["Favorites", "Cloud", "Locations"];
+pub const SECTIONS: [&str; 4] = ["Favorites", "Cloud", "Locations", "Tags"];
 
 #[derive(Debug, Default)]
 pub struct Sidebar {
     pub favorites: Vec<Place>,
     pub cloud: Vec<Place>,
     pub drives: Vec<Place>,
+    pub tags: Vec<crate::tags::Tag>,
     /// Item under the mouse (index across all sections).
     pub hover: Option<usize>,
     pub hover_header: Option<usize>,
-    pub collapsed: [bool; 3],
+    pub collapsed: [bool; 4],
 }
 
 fn lower_components(p: &Path) -> Vec<String> {
@@ -43,16 +44,26 @@ pub fn best_match(items: &[Place], current: &Path) -> Option<usize> {
 
 impl Sidebar {
     pub fn load() -> Sidebar {
-        Sidebar { favorites: shell::favorites(), cloud: shell::cloud(), drives: shell::drives(), ..Default::default() }
+        Sidebar { favorites: shell::favorites(), cloud: shell::cloud(), drives: shell::drives(), tags: crate::tags::Tag::ALL.to_vec(), ..Default::default() }
     }
 
     fn sections(&self) -> [&[Place]; 3] {
         [&self.favorites, &self.cloud, &self.drives]
     }
 
-    /// Item by index across Favorites, Cloud, Locations.
+    fn lens(&self) -> [usize; 4] {
+        [self.favorites.len(), self.cloud.len(), self.drives.len(), self.tags.len()]
+    }
+
+    /// Item by index across Favorites, Cloud, Locations (tags come after them).
     pub fn place(&self, i: usize) -> Option<&Place> {
         self.sections().into_iter().flatten().nth(i)
+    }
+
+    /// Tag for an index in the Tags section.
+    pub fn tag_at(&self, i: usize) -> Option<crate::tags::Tag> {
+        let places: usize = self.lens()[..3].iter().sum();
+        i.checked_sub(places).and_then(|k| self.tags.get(k).copied())
     }
 
     fn all(&self) -> Vec<Place> {
@@ -64,12 +75,12 @@ impl Sidebar {
         let mut y = area.y + 4.0;
         let mut first = 0;
         let mut out = Vec::new();
-        for (s, items) in self.sections().into_iter().enumerate() {
-            if !items.is_empty() {
+        for (s, len) in self.lens().into_iter().enumerate() {
+            if len > 0 {
                 out.push((SECTIONS[s], Rect::new(area.x + 20.0, y, area.w - 32.0, HEADER_H), s, first));
-                y += HEADER_H + if self.collapsed[s] { 0.0 } else { items.len() as f32 * ITEM_H } + SECTION_GAP;
+                y += HEADER_H + if self.collapsed[s] { 0.0 } else { len as f32 * ITEM_H } + SECTION_GAP;
             }
-            first += items.len();
+            first += len;
         }
         out
     }
@@ -85,13 +96,13 @@ impl Sidebar {
     }
 
     pub fn item_rects(&self, area: Rect) -> Vec<(usize, Rect)> {
-        let sections = self.sections();
+        let lens = self.lens();
         let mut out = Vec::new();
         for (_, header, s, first) in self.layout(area) {
             if self.collapsed[s] {
                 continue;
             }
-            for k in 0..sections[s].len() {
+            for k in 0..lens[s] {
                 let r = Rect::new(area.x + 12.0, header.bottom() + k as f32 * ITEM_H, area.w - 24.0, ITEM_H);
                 if r.bottom() <= area.bottom() {
                     out.push((first + k, r));
@@ -128,6 +139,14 @@ pub fn paint(app: &App) {
     }
     let current = best_match(&s.all(), app.current_dir());
     for (i, r) in s.item_rects(area) {
+        if let Some(tag) = s.tag_at(i) {
+            if s.hover == Some(i) {
+                g.fill_round(r, 6.0, t.hover);
+            }
+            g.fill_round(Rect::new(r.x + 11.0, r.y + 9.0, 10.0, 10.0), 5.0, crate::theme::Color::rgb(tag.rgb()));
+            g.text(tag.name(), Rect::new(r.x + 32.0, r.y, r.w - 38.0, r.h), &g.fonts.body, t.text);
+            continue;
+        }
         let Some(p) = s.place(i) else { continue };
         if current == Some(i) {
             g.fill_round(r, 6.0, t.text.with_alpha(if t.dark { 0.10 } else { 0.08 }));
