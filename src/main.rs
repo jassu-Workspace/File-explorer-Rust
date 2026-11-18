@@ -9,6 +9,7 @@ mod listing;
 mod nav;
 mod search;
 mod selection;
+mod share;
 mod shell;
 mod theme;
 mod tags;

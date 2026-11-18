@@ -132,6 +132,7 @@ pub struct App {
     pub icon_size: f32,
     pub group_by: GroupBy,
     pub tags: crate::tags::Tags,
+    share: Option<crate::share::Share>,
     /// Set while the list shows the files of one sidebar tag.
     pub tag_view: Option<crate::tags::Tag>,
     /// Groups over `list.entries` for the current `group_by` (empty when not grouping).
@@ -454,6 +455,26 @@ impl App {
         self.report("Saving tags", r);
         self.invalidate();
         true
+    }
+
+    /// Opens the Windows share sheet for the selection.
+    fn share_selection(&mut self) {
+        let paths = self.selected_paths();
+        if paths.is_empty() {
+            self.error = Some("Select files to share.".into());
+            self.invalidate();
+            return;
+        }
+        if self.share.is_none() {
+            match crate::share::Share::register(self.hwnd) {
+                Ok(s) => self.share = Some(s),
+                Err(e) => return self.report("Share", Err(e)),
+            }
+        }
+        if let Some(s) = &self.share {
+            let r = s.show(self.hwnd, paths);
+            self.report("Share", r);
+        }
     }
 
     fn tags_button(&mut self, r: &ToolbarRects) {
@@ -1435,6 +1456,7 @@ impl App {
             Hot::Search => self.focus_search(),
             Hot::Group => self.group_menu(r),
             Hot::Tags => self.tags_button(r),
+            Hot::Share => self.share_selection(),
             Hot::Action => {
                 // Same menu as right-click, anchored under the button.
                 let mut pt = POINT { x: (r.action.x * self.scale) as i32, y: (r.action.bottom() * self.scale) as i32 };
@@ -1928,6 +1950,7 @@ pub fn run() -> Result<()> {
             band: None,
             group_by: GroupBy::None,
             tags: crate::tags::Tags::load(),
+            share: None,
             tag_view: None,
             groups: Vec::new(),
             gallery_scroll: 0.0,

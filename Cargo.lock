@@ -7,6 +7,8 @@ name = "fexplorer"
 version = "0.1.0"
 dependencies = [
  "windows",
+ "windows-collections",
+ "windows-future",
  "windows-numerics",
 ]
 
