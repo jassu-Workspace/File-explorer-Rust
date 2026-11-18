@@ -112,7 +112,7 @@ impl Grid {
 }
 
 /// Finder-style folder: a darker back with the tab, a lighter front panel.
-fn paint_folder(app: &App, r: Rect) {
+pub fn paint_folder(app: &App, r: Rect) {
     let (back, front) = if app.theme.dark { (Color::rgb(0x3D8FD9), Color::rgb(0x5AA9EE)) } else { (Color::rgb(0x5AA8EC), Color::rgb(0x84C1F5)) };
     let g = &app.gfx;
     // Proportions match a 16-unit folder glyph scaled into the icon box.

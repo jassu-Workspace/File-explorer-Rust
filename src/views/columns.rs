@@ -89,20 +89,31 @@ pub fn paint(app: &mut App) {
 
 fn paint_info(app: &mut App) {
     let Some(e) = selected_file(app).cloned() else { return };
-    let t = app.theme;
     let x = col_rect(app, app.columns.cols.len()).x;
-    let c = app.layout.content;
-    let idx = shell::icon_index(&e, &mut app.icon_idx);
-    if let Some(b) = app.gfx.icon(idx, IconSize::Jumbo) {
-        app.gfx.bitmap(&b, Rect::new(x + (INFO_W - 64.0) / 2.0, c.y + 32.0, 64.0, 64.0));
+    let top = app.layout.content.y;
+    paint_info_at(app, &e, x, top);
+}
+
+/// Info panel (icon, name, kind, size, modified) for one item, INFO_W wide, starting at (x, top).
+pub fn paint_info_at(app: &mut App, e: &Entry, x: f32, top: f32) {
+    let t = app.theme;
+    let icon = Rect::new(x + (INFO_W - 64.0) / 2.0, top + 32.0, 64.0, 64.0);
+    if e.is_dir() {
+        crate::views::grid::paint_folder(app, icon);
+    } else {
+        let idx = shell::icon_index(e, &mut app.icon_idx);
+        if let Some(b) = app.gfx.icon(idx, IconSize::Jumbo) {
+            app.gfx.bitmap(&b, icon);
+        }
     }
-    let name = shell::display_name(&e);
-    app.gfx.text(&name, Rect::new(x + 16.0, c.y + 108.0, INFO_W - 32.0, 24.0), &app.gfx.fonts.big, t.text);
-    let kind = shell::type_name(&e, &mut app.type_names);
+    let name = shell::display_name(e);
+    app.gfx.text(&name, Rect::new(x + 16.0, top + 108.0, INFO_W - 32.0, 24.0), &app.gfx.fonts.big, t.text);
+    let kind = shell::type_name(e, &mut app.type_names);
     let modified = format_modified(shell::to_local(e.modified), shell::now_local());
-    let rows = [("Kind", kind), ("Size", format_size(e.size)), ("Modified", modified)];
+    let size = if e.is_dir() { "--".to_string() } else { format_size(e.size) };
+    let rows = [("Kind", kind), ("Size", size), ("Modified", modified)];
     for (k, (label, value)) in rows.iter().enumerate() {
-        let y = c.y + 148.0 + k as f32 * 22.0;
+        let y = top + 148.0 + k as f32 * 22.0;
         app.gfx.text(label, Rect::new(x + 16.0, y, 80.0, 22.0), &app.gfx.fonts.small, t.text_dim);
         app.gfx.text(value, Rect::new(x + 96.0, y, INFO_W - 112.0, 22.0), &app.gfx.fonts.body, t.text);
     }

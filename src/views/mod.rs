@@ -1,4 +1,5 @@
 pub mod columns;
+pub mod gallery;
 pub mod grid;
 pub mod list;
 pub mod pathbar;
@@ -22,6 +23,10 @@ pub fn paint(app: &mut App) {
     match app.view {
         crate::app::View::Columns => {
             columns::paint(app);
+            list::paint_message(app);
+        }
+        crate::app::View::Gallery => {
+            gallery::paint(app);
             list::paint_message(app);
         }
         crate::app::View::Icon => {

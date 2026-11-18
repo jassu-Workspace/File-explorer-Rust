@@ -53,6 +53,7 @@ pub enum View {
     Icon,
     List,
     Columns,
+    Gallery,
 }
 
 /// The element under the mouse, for hover drawing.
@@ -117,6 +118,8 @@ pub struct App {
     band: Option<(f32, f32, Vec<usize>, f32, f32)>,
     /// Icon-view icon size in DIPs (Ctrl+Plus / Ctrl+Minus).
     pub icon_size: f32,
+    /// Gallery strip horizontal scroll.
+    pub gallery_scroll: f32,
     thumbnailer: Option<crate::thumbs::Thumbnailer>,
     thumb_pending: std::collections::HashSet<crate::thumbs::ThumbKey>,
     /// Files Windows has no thumbnail for; not asked again.
@@ -228,6 +231,14 @@ impl App {
         } else {
             self.columns = Columns::default();
         }
+        if v == View::Gallery && self.list.sel.focus().is_none() && !self.list.entries.is_empty() {
+            // The gallery always previews something.
+            self.list.sel.click(0);
+        }
+        if let Some(f) = self.list.sel.focus() {
+            self.reveal(f);
+        }
+        self.list.scroll_y = self.list.scroll_y.min(self.max_scroll());
         self.invalidate();
     }
 
@@ -383,7 +394,11 @@ impl App {
 
     /// Area holding the items of the list or icon view.
     fn item_area(&self) -> crate::layout::Rect {
-        if self.view == View::Icon { self.layout.content } else { self.layout.rows }
+        match self.view {
+            View::Icon => self.layout.content,
+            View::Gallery => views::gallery::areas(self.layout.content).1,
+            _ => self.layout.rows,
+        }
     }
 
     /// `None` outside the item area; `Some(None)` on empty space inside it.
@@ -394,6 +409,7 @@ impl App {
         }
         Some(match self.view {
             View::Icon => self.grid().cell_at(x - a.x, y - a.y, self.list.scroll_y, self.list.entries.len()),
+            View::Gallery => views::gallery::strip_at(x - a.x, self.gallery_scroll, self.list.entries.len()).filter(|_| y - a.y >= 12.0),
             _ => self.list.row_at(y - a.y),
         })
     }
@@ -401,6 +417,10 @@ impl App {
     /// Where an item's name is drawn (inline rename and keyboard context menus anchor here).
     fn name_rect(&self, i: usize) -> crate::layout::Rect {
         let a = self.item_area();
+        if self.view == View::Gallery {
+            let r = views::gallery::strip_item(i, self.gallery_scroll);
+            return crate::layout::Rect::new(a.x + r.x, a.y + 12.0, r.w, r.h);
+        }
         if self.view == View::Icon {
             let g = self.grid();
             let c = g.cell(i);
@@ -415,6 +435,7 @@ impl App {
         let h = self.item_area().h;
         match self.view {
             View::Icon => (self.grid().content_h(self.list.entries.len()) - h).max(0.0),
+            View::Gallery => 0.0,
             _ => self.list.max_scroll(h),
         }
     }
@@ -424,6 +445,7 @@ impl App {
         let h = self.item_area().h;
         match self.view {
             View::Icon => self.list.scroll_y = self.grid().scroll_to_show(i, self.list.scroll_y, h),
+            View::Gallery => self.gallery_scroll = views::gallery::strip_scroll_to_show(i, self.gallery_scroll, self.item_area().w),
             _ => self.list.ensure_visible(i, h),
         }
     }
@@ -516,6 +538,7 @@ impl App {
             View::Icon => 0,
             View::List => 1,
             View::Columns => 2,
+            View::Gallery => 3,
         }
     }
 
@@ -893,7 +916,7 @@ impl App {
 
     /// Inline rename over the focused row's name (list view).
     fn start_rename(&mut self) {
-        if self.columns_view() {
+        if self.columns_view() || self.view == View::Gallery {
             return;
         }
         let Some(i) = self.list.sel.focus().filter(|&i| i < self.list.entries.len()) else { return };
@@ -1228,6 +1251,7 @@ impl App {
             Hot::View(0) => self.set_view(View::Icon),
             Hot::View(1) => self.set_view(View::List),
             Hot::View(2) => self.set_view(View::Columns),
+            Hot::View(3) => self.set_view(View::Gallery),
             Hot::Search => self.focus_search(),
             Hot::Action => {
                 // Same menu as right-click, anchored under the button.
@@ -1261,8 +1285,19 @@ impl App {
             0x31 if mods().ctrl => self.set_view(View::Icon), // Ctrl+1
             0x32 if mods().ctrl => self.set_view(View::List), // Ctrl+2
             0x33 if mods().ctrl => self.set_view(View::Columns), // Ctrl+3
+            0x34 if mods().ctrl => self.set_view(View::Gallery), // Ctrl+4
             0xBB | 0x6B if mods().ctrl && self.view == View::Icon => self.zoom_icons(16.0), // Ctrl+Plus
             0xBD | 0x6D if mods().ctrl && self.view == View::Icon => self.zoom_icons(-16.0), // Ctrl+Minus
+            v if self.view == View::Gallery && [VK_LEFT.0, VK_RIGHT.0, VK_UP.0, VK_DOWN.0].contains(&v) => {
+                let n = self.list.entries.len();
+                if n > 0 {
+                    let cur = self.list.sel.focus();
+                    let next = if v == VK_LEFT.0 || v == VK_UP.0 { cur.map_or(0, |c| c.saturating_sub(1)) } else { cur.map_or(0, |c| (c + 1).min(n - 1)) };
+                    self.list.sel.click(next);
+                    self.reveal(next);
+                    self.invalidate();
+                }
+            }
             v if self.view == View::Icon && [VK_LEFT.0, VK_RIGHT.0, VK_UP.0, VK_DOWN.0].contains(&v) => {
                 use views::grid::Dir;
                 let d = match v {
@@ -1544,7 +1579,11 @@ impl App {
                 let notches = hi(wp.0 as isize) as f32 / WHEEL_DELTA as f32;
                 // The rename box is placed over a row; scrolling would leave it behind.
                 self.commit_rename();
-                if self.columns_view() {
+                if self.view == View::Gallery {
+                    let n = self.list.entries.len() as f32;
+                    let max = (views::gallery::STRIP_PAD * 2.0 + n * (views::gallery::THUMB + views::gallery::GAP) - self.item_area().w).max(0.0);
+                    self.gallery_scroll = (self.gallery_scroll - notches * 3.0 * views::gallery::THUMB).clamp(0.0, max);
+                } else if self.columns_view() {
                     self.column_wheel(notches, lp);
                 } else {
                     self.list_wheel(notches);
@@ -1705,6 +1744,7 @@ pub fn run() -> Result<()> {
             view: View::Icon,
             icon_size: views::grid::ICON_DEFAULT,
             band: None,
+            gallery_scroll: 0.0,
             thumbnailer: None,
             thumb_pending: Default::default(),
             thumb_none: Default::default(),
