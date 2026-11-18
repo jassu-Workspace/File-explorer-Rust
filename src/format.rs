@@ -1,6 +1,18 @@
 const MONTH_NAMES: [&str; 12] =
     ["January", "February", "March", "April", "May", "June", "July", "August", "September", "October", "November", "December"];
 
+/// Status line: "12 items · 3 selected · 4.2 MB" (size of the selected files, when any have one).
+pub fn selection_summary(items: usize, selected: usize, selected_bytes: u64) -> String {
+    let mut s = if items == 1 { "1 item".to_string() } else { format!("{items} items") };
+    if selected > 0 {
+        s.push_str(&format!(" · {selected} selected"));
+        if selected_bytes > 0 {
+            s.push_str(&format!(" · {}", format_size(selected_bytes)));
+        }
+    }
+    s
+}
+
 /// Finder-like size groups: (rank, label).
 pub fn size_group(is_dir: bool, bytes: u64) -> (i64, &'static str) {
     const KB: u64 = 1024;
@@ -89,6 +101,14 @@ mod tests {
         for (b, s) in [(0, "0 bytes"), (1, "1 byte"), (900, "900 bytes"), (4096, "4 KB"), (1_258_291, "1.2 MB"), (5_368_709_120, "5.0 GB")] {
             assert_eq!(format_size(b), s, "{b}");
         }
+    }
+
+    #[test]
+    fn status_summary() {
+        assert_eq!(selection_summary(12, 0, 0), "12 items");
+        assert_eq!(selection_summary(1, 0, 0), "1 item");
+        assert_eq!(selection_summary(12, 3, 4_404_019), "12 items · 3 selected · 4.2 MB");
+        assert_eq!(selection_summary(12, 1, 0), "12 items · 1 selected");
     }
 
     #[test]

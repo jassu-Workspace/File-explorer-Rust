@@ -237,7 +237,7 @@ mod column_tests {
     use std::path::{Path, PathBuf};
 
     fn e(name: &str, dir: bool) -> Entry {
-        Entry { name: name.into(), size: 0, modified: 0, attrs: if dir { 0x10 } else { 0x20 }, rel_dir: None }
+        Entry { name: name.into(), size: 0, modified: 0, created: 0, attrs: if dir { 0x10 } else { 0x20 }, rel_dir: None }
     }
 
     fn root() -> Columns {

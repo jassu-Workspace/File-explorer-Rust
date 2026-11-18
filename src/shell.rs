@@ -400,7 +400,7 @@ mod tests {
     use std::path::{Path, PathBuf};
 
     fn file(name: &str) -> Entry {
-        Entry { name: name.into(), size: 0, modified: 0, attrs: 0x20, rel_dir: None }
+        Entry { name: name.into(), size: 0, modified: 0, created: 0, attrs: 0x20, rel_dir: None }
     }
 
     #[test]
@@ -415,7 +415,7 @@ mod tests {
 
     #[test]
     fn display_name_hides_shortcut_extensions() {
-        let e = |n: &str| Entry { name: n.into(), size: 0, modified: 0, attrs: 0x20, rel_dir: None };
+        let e = |n: &str| Entry { name: n.into(), size: 0, modified: 0, created: 0, attrs: 0x20, rel_dir: None };
         assert_eq!(display_name(&e("Report.docx.lnk"), true), "Report.docx");
         assert_eq!(display_name(&e("Site.URL"), true), "Site");
         assert_eq!(display_name(&e("notes.txt"), true), "notes.txt");

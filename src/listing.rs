@@ -13,6 +13,8 @@ pub struct Entry {
     pub size: u64,
     /// FILETIME ticks (100 ns since 1601, UTC).
     pub modified: u64,
+    /// FILETIME ticks of creation.
+    pub created: u64,
     pub attrs: u32,
     /// Parent folder relative to the search root; `None` for plain listings.
     pub rel_dir: Option<PathBuf>,
@@ -36,7 +38,7 @@ impl Entry {
 /// On Windows `DirEntry::metadata` comes from the FindNextFileW data: no extra syscall.
 pub fn entry_from(de: &std::fs::DirEntry) -> io::Result<Entry> {
     let m = de.metadata()?;
-    Ok(Entry { name: de.file_name(), size: m.file_size(), modified: m.last_write_time(), attrs: m.file_attributes(), rel_dir: None })
+    Ok(Entry { name: de.file_name(), size: m.file_size(), modified: m.last_write_time(), created: m.creation_time(), attrs: m.file_attributes(), rel_dir: None })
 }
 
 /// Lists `path`, keeping entries whose attributes pass `keep` (the Explorer visibility rules).
@@ -78,6 +80,7 @@ pub fn group_entries(entries: &mut Vec<Entry>, mut key: impl FnMut(&Entry) -> (i
 pub enum SortKey {
     Name,
     Modified,
+    Created,
     Size,
     Kind,
 }
@@ -129,6 +132,7 @@ pub fn sort_entries(entries: &mut [Entry], key: SortKey, descending: bool) {
             let o = match key {
                 SortKey::Name => Ordering::Equal,
                 SortKey::Modified => a.modified.cmp(&b.modified),
+                SortKey::Created => a.created.cmp(&b.created),
                 SortKey::Size => a.size.cmp(&b.size),
                 SortKey::Kind => exts[i].cmp(&exts[j]),
             }
@@ -172,7 +176,7 @@ mod tests {
     }
 
     fn fake(name: &str, dir: bool, size: u64, modified: u64) -> Entry {
-        Entry { name: name.into(), size, modified, attrs: if dir { 0x10 } else { 0x20 }, rel_dir: None }
+        Entry { name: name.into(), size, modified, created: 0, attrs: if dir { 0x10 } else { 0x20 }, rel_dir: None }
     }
 
     #[test]
@@ -245,6 +249,16 @@ mod tests {
         assert_eq!(names(&v), ["a", "c", "b"]);
         sort_entries(&mut v, SortKey::Modified, false);
         assert_eq!(names(&v), ["a", "c", "b"]);
+    }
+
+    #[test]
+    fn sort_by_created() {
+        let mut v = vec![fake("a", false, 0, 0), fake("b", false, 0, 0), fake("c", false, 0, 0)];
+        for (e, c) in v.iter_mut().zip([3, 1, 2]) {
+            e.created = c;
+        }
+        sort_entries(&mut v, SortKey::Created, false);
+        assert_eq!(names(&v), ["b", "c", "a"]);
     }
 
     #[test]

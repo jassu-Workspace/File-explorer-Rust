@@ -314,7 +314,7 @@ mod tests {
     use std::time::{Duration, Instant};
 
     fn e(name: &str, dir: bool, size: u64) -> Entry {
-        Entry { name: name.into(), size, modified: 0, attrs: if dir { 0x10 } else { 0x20 }, rel_dir: None }
+        Entry { name: name.into(), size, modified: 0, created: 0, attrs: if dir { 0x10 } else { 0x20 }, rel_dir: None }
     }
 
     fn lv() -> ListView {

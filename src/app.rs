@@ -47,6 +47,20 @@ const ID_ANIM_TIMER: usize = 2;
 const ID_HOVER_SELECT: usize = 3;
 /// Menu ids 100..107 are the seven color tags.
 const TAG_CMD: usize = 100;
+/// View menu ids: 200..203 icon presets, 204 details, 205 columns, 206 gallery.
+const VIEW_CMD: usize = 200;
+/// Sort menu ids: 220 + SortKey index, 230 ascending, 231 descending.
+const SORT_CMD: usize = 220;
+/// Group menu ids: 240 + GroupBy index.
+const GROUP_CMD: usize = 240;
+const SORT_KEYS: [(crate::listing::SortKey, &str); 5] = [
+    (crate::listing::SortKey::Name, "Name"),
+    (crate::listing::SortKey::Modified, "Date modified"),
+    (crate::listing::SortKey::Created, "Date created"),
+    (crate::listing::SortKey::Kind, "Type"),
+    (crate::listing::SortKey::Size, "Size"),
+];
+const GROUPS: [(GroupBy, &str); 5] = [(GroupBy::None, "(None)"), (GroupBy::Kind, "Type"), (GroupBy::Date, "Date modified"), (GroupBy::Size, "Size"), (GroupBy::Name, "Name")];
 const SCROLL_ANIM: Duration = Duration::from_millis(120);
 const HOVER_ANIM: Duration = Duration::from_millis(100);
 const COLUMN_ANIM: Duration = Duration::from_millis(150);
@@ -453,7 +467,7 @@ impl App {
             .into_iter()
             .filter_map(|p| {
                 let m = std::fs::symlink_metadata(&p).ok()?;
-                Some(Entry { name: p.file_name()?.to_os_string(), size: m.file_size(), modified: m.last_write_time(), attrs: m.file_attributes(), rel_dir: p.parent().map(Path::to_path_buf) })
+                Some(Entry { name: p.file_name()?.to_os_string(), size: m.file_size(), modified: m.last_write_time(), created: m.creation_time(), attrs: m.file_attributes(), rel_dir: p.parent().map(Path::to_path_buf) })
             })
             .collect();
         self.list.set_entries(entries);
@@ -610,6 +624,78 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Builds the View, Sort by and Group by submenus (Explorer's right-click on empty space).
+    fn view_sort_group_menus(&self, into: HMENU) {
+        let radio = |on: bool| MF_STRING | if on { MF_CHECKED } else { MF_UNCHECKED };
+        unsafe {
+            if let Ok(v) = CreatePopupMenu() {
+                let preset = views::grid::IconPreset::nearest(self.icon_size);
+                for (k, p) in views::grid::IconPreset::ALL.into_iter().enumerate() {
+                    let _ = AppendMenuW(v, radio(self.view == View::Icon && p == preset), VIEW_CMD + k, &windows::core::HSTRING::from(p.label()));
+                }
+                let _ = AppendMenuW(v, MF_SEPARATOR, 0, None);
+                for (k, (view, label)) in [(View::List, "Details"), (View::Columns, "Columns"), (View::Gallery, "Gallery")].into_iter().enumerate() {
+                    let _ = AppendMenuW(v, radio(self.view == view), VIEW_CMD + 4 + k, &windows::core::HSTRING::from(label));
+                }
+                let _ = AppendMenuW(into, MF_POPUP, v.0 as usize, w!("View"));
+            }
+            if let Ok(s) = CreatePopupMenu() {
+                for (k, (key, label)) in SORT_KEYS.into_iter().enumerate() {
+                    let _ = AppendMenuW(s, radio(self.list.sort.0 == key), SORT_CMD + k, &windows::core::HSTRING::from(label));
+                }
+                let _ = AppendMenuW(s, MF_SEPARATOR, 0, None);
+                let _ = AppendMenuW(s, radio(!self.list.sort.1), SORT_CMD + 10, w!("Ascending"));
+                let _ = AppendMenuW(s, radio(self.list.sort.1), SORT_CMD + 11, w!("Descending"));
+                let _ = AppendMenuW(into, MF_POPUP, s.0 as usize, w!("Sort by"));
+            }
+            if let Ok(g) = CreatePopupMenu() {
+                for (k, (gb, label)) in GROUPS.into_iter().enumerate() {
+                    let _ = AppendMenuW(g, radio(self.group_by == gb), GROUP_CMD + k, &windows::core::HSTRING::from(label));
+                }
+                let _ = AppendMenuW(into, MF_POPUP, g.0 as usize, w!("Group by"));
+            }
+        }
+    }
+
+    /// Applies a View/Sort/Group menu command; false when `cmd` is not one of them.
+    fn apply_view_cmd(&mut self, cmd: usize) -> bool {
+        match cmd {
+            c if (VIEW_CMD..VIEW_CMD + 4).contains(&c) => {
+                self.set_view(View::Icon);
+                self.icon_size = views::grid::IconPreset::ALL[c - VIEW_CMD].size();
+                if let Some(f) = self.list.sel.focus() {
+                    self.reveal(f);
+                }
+                self.list.scroll_y = self.list.scroll_y.min(self.max_scroll());
+            }
+            c if c == VIEW_CMD + 4 => self.set_view(View::List),
+            c if c == VIEW_CMD + 5 => self.set_view(View::Columns),
+            c if c == VIEW_CMD + 6 => self.set_view(View::Gallery),
+            c if (SORT_CMD..SORT_CMD + SORT_KEYS.len()).contains(&c) || c == SORT_CMD + 10 || c == SORT_CMD + 11 => {
+                let (mut key, mut desc) = self.list.sort;
+                match c - SORT_CMD {
+                    10 => desc = false,
+                    11 => desc = true,
+                    k => key = SORT_KEYS[k].0,
+                }
+                let keep = self.list.selection_keys();
+                self.list.sort = (key, desc);
+                self.list.resort();
+                self.regroup();
+                self.list.restore_selection(&keep);
+            }
+            c if (GROUP_CMD..GROUP_CMD + GROUPS.len()).contains(&c) => {
+                self.group_by = GROUPS[c - GROUP_CMD].0;
+                self.list.sel.clear();
+                self.regroup();
+                self.list.scroll_y = 0.0;
+            }
+            _ => return false,
+        }
+        self.invalidate();
+        true
     }
 
     fn toggle_pathbar(&mut self) {
@@ -1412,6 +1498,8 @@ impl App {
                     let _ = AppendMenuW(m, MF_POPUP, sub.0 as usize, w!("Tags"));
                 }
             } else {
+                self.view_sort_group_menus(m);
+                let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
                 add(PASTE, w!("Paste\tCtrl+V"), if can_paste && !self.searching { MF_ENABLED } else { MF_GRAYED });
                 add(NEW_FOLDER, w!("New Folder\tCtrl+Shift+N"), if self.searching { MF_GRAYED } else { MF_ENABLED });
                 let _ = AppendMenuW(m, MF_SEPARATOR, 0, None);
@@ -1457,7 +1545,9 @@ impl App {
             PATHBAR => self.toggle_pathbar(),
             SETTINGS => self.open_settings(),
             c => {
-                self.apply_tag_cmd(c);
+                if !self.apply_view_cmd(c) {
+                    self.apply_tag_cmd(c);
+                }
             }
         }
     }
@@ -1677,6 +1767,11 @@ impl App {
                 self.clear_search_field();
                 self.end_search(true);
             }
+            0x31..=0x34 if mods().ctrl && mods().shift => {
+                // Ctrl+Shift+1..4: extra large, large, medium, small icons (Explorer's shortcuts).
+                self.apply_view_cmd(VIEW_CMD + (vk - 0x31) as usize);
+            }
+            0x36 if mods().ctrl && mods().shift => self.set_view(View::List), // Ctrl+Shift+6: details
             0x31 if mods().ctrl => self.set_view(View::Icon), // Ctrl+1
             0x32 if mods().ctrl => self.set_view(View::List), // Ctrl+2
             0x33 if mods().ctrl => self.set_view(View::Columns), // Ctrl+3

@@ -7,12 +7,48 @@ use crate::theme::{Color, ROW_H};
 
 /// Left/right padding of the grid inside the content area.
 pub const PAD: f32 = 12.0;
-pub const ICON_MIN: f32 = 48.0;
-pub const ICON_MAX: f32 = 128.0;
+pub const ICON_MIN: f32 = 32.0;
+pub const ICON_MAX: f32 = 256.0;
 pub const ICON_DEFAULT: f32 = 64.0;
 /// Height of a group's section header ("Today", "PDF Document", ...).
 pub const HEADER_H: f32 = 28.0;
 const NAME_H: f32 = 32.0; // two lines of 12 px text
+
+/// Explorer's icon view sizes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum IconPreset {
+    ExtraLarge,
+    Large,
+    Medium,
+    Small,
+}
+
+impl IconPreset {
+    pub const ALL: [IconPreset; 4] = [IconPreset::ExtraLarge, IconPreset::Large, IconPreset::Medium, IconPreset::Small];
+
+    pub fn size(self) -> f32 {
+        match self {
+            IconPreset::ExtraLarge => 192.0,
+            IconPreset::Large => 128.0,
+            IconPreset::Medium => 64.0,
+            IconPreset::Small => 32.0,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            IconPreset::ExtraLarge => "Extra large icons",
+            IconPreset::Large => "Large icons",
+            IconPreset::Medium => "Medium icons",
+            IconPreset::Small => "Small icons",
+        }
+    }
+
+    /// The preset closest to a zoomed size (for the menu check mark).
+    pub fn nearest(size: f32) -> IconPreset {
+        IconPreset::ALL.into_iter().min_by(|a, b| (a.size() - size).abs().total_cmp(&(b.size() - size).abs())).unwrap_or(IconPreset::Medium)
+    }
+}
 
 pub fn clamp_icon(size: f32) -> f32 {
     size.clamp(ICON_MIN, ICON_MAX)
@@ -368,6 +404,14 @@ mod tests {
         assert_eq!(g.cols, 1);
         assert_eq!(g.cell(3).y, 3.0 * crate::theme::ROW_H);
         assert_eq!(g.cell_at(10.0, crate::theme::ROW_H * 2.5, 0.0, 5), Some(2));
+    }
+
+    #[test]
+    fn explorer_icon_presets() {
+        assert_eq!(IconPreset::ALL.map(|p| p.size()), [192.0, 128.0, 64.0, 32.0]);
+        assert_eq!(IconPreset::ALL.map(|p| p.label()), ["Extra large icons", "Large icons", "Medium icons", "Small icons"]);
+        assert_eq!(IconPreset::nearest(70.0), IconPreset::Medium);
+        assert!(clamp_icon(192.0) == 192.0 && clamp_icon(32.0) == 32.0, "presets are inside the zoom range");
     }
 
     #[test]

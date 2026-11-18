@@ -71,7 +71,9 @@ pub fn status_text(app: &App) -> String {
         return s;
     }
     let n = app.item_count();
-    let items = if n == 1 { "1 item".to_string() } else { format!("{n} items") };
+    let sel: Vec<usize> = if app.columns_view() { Vec::new() } else { app.list.sel.selected() };
+    let bytes: u64 = sel.iter().filter_map(|&i| app.list.entries.get(i)).filter(|e| !e.is_dir()).map(|e| e.size).sum();
+    let items = crate::format::selection_summary(n, sel.len(), bytes);
     match app.free {
         Some(f) => format!("{items}, {} available", format_size(f)),
         None => items,
