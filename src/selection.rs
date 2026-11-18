@@ -44,6 +44,12 @@ impl Selection {
         let next = (cur + delta).clamp(0, count as isize - 1) as usize;
         if extend { self.shift_click(next) } else { self.click(next) }
     }
+    /// Replaces the selected set (drag-box selection); focus and anchor stay.
+    pub fn set(&mut self, mut idx: Vec<usize>) {
+        idx.sort_unstable();
+        idx.dedup();
+        self.sel = idx;
+    }
     pub fn select_all(&mut self, count: usize) {
         self.sel = (0..count).collect();
     }
@@ -114,6 +120,15 @@ mod tests {
         let mut e = Selection::new();
         e.move_focus(1, false, 0);
         assert!(e.selected().is_empty());
+    }
+
+    #[test]
+    fn set_replaces_selection_keeping_focus() {
+        let mut s = Selection::new();
+        s.click(4);
+        s.set(vec![7, 2, 7]);
+        assert_eq!(s.selected(), [2, 7]);
+        assert_eq!(s.focus(), Some(4));
     }
 
     #[test]

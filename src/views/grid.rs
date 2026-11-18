@@ -71,6 +71,17 @@ impl Grid {
         first.min(n)..(last_row * self.cols).min(n)
     }
 
+    /// Items whose cell intersects `r` (grid coordinates, scroll included).
+    pub fn cells_in(&self, r: Rect, n: usize) -> Vec<usize> {
+        let col = |x: f32| ((x - PAD) / self.cell_w).floor().clamp(0.0, self.cols as f32 - 1.0) as usize;
+        if r.right() <= PAD || r.x >= PAD + self.cols as f32 * self.cell_w || r.bottom() <= 0.0 {
+            return Vec::new();
+        }
+        let (c0, c1) = (col(r.x), col(r.right() - 0.01));
+        let (r0, r1) = ((r.y.max(0.0) / self.cell_h) as usize, ((r.bottom() - 0.01) / self.cell_h) as usize);
+        (r0..=r1).flat_map(|row| (c0..=c1).map(move |c| row * self.cols + c)).filter(|&i| i < n).collect()
+    }
+
     /// Next focus for an arrow key. Moving down onto a short last row lands on the last item.
     pub fn step(&self, cur: Option<usize>, d: Dir, n: usize) -> usize {
         let Some(c) = cur else { return 0 };
@@ -150,6 +161,13 @@ pub fn paint(app: &mut App) {
         };
         app.gfx.text(&name, text, &app.gfx.fonts.cell, fg);
     }
+    if let Some(b) = app.band_rect() {
+        let r = Rect::new(content.x + b.x, content.y + b.y - scroll, b.w, b.h);
+        app.gfx.fill_rect(r, t.accent.with_alpha(0.15));
+        for (x1, y1, x2, y2) in [(r.x, r.y, r.right(), r.y), (r.x, r.bottom(), r.right(), r.bottom()), (r.x, r.y, r.x, r.bottom()), (r.right(), r.y, r.right(), r.bottom())] {
+            app.gfx.line(x1, y1, x2, y2, t.accent.with_alpha(0.7));
+        }
+    }
     app.gfx.pop_clip();
 }
 
@@ -203,6 +221,16 @@ mod tests {
         assert_eq!(g.scroll_to_show(45, 0.0, g.cell_h * 2.0), g.cell_h * 4.0);
         assert_eq!(g.scroll_to_show(0, g.cell_h * 4.0, g.cell_h * 2.0), 0.0);
         assert_eq!(g.scroll_to_show(10, g.cell_h, g.cell_h * 2.0), g.cell_h);
+    }
+
+    #[test]
+    fn drag_box_selects_touched_cells() {
+        let g = Grid::new(1000.0, 64.0); // 9 columns
+        let r = Rect::new(PAD + g.cell_w * 0.5, g.cell_h * 0.5, g.cell_w * 1.2, g.cell_h);
+        assert_eq!(g.cells_in(r, 20), [0, 1, 9, 10]);
+        let past_end = Rect::new(PAD, g.cell_h * 2.2, g.cell_w * 9.0, 10.0);
+        assert_eq!(g.cells_in(past_end, 20), [18, 19], "only existing items");
+        assert!(g.cells_in(Rect::new(0.0, 0.0, 2.0, 2.0), 20).is_empty(), "padding touches nothing");
     }
 
     #[test]

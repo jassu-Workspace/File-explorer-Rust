@@ -112,6 +112,8 @@ pub struct App {
     pub history: History,
     pub list: ListView,
     pub view: View,
+    /// Drag-box selection in icon view: start point in grid coordinates, the selection it adds to, current point.
+    band: Option<(f32, f32, Vec<usize>, f32, f32)>,
     /// Icon-view icon size in DIPs (Ctrl+Plus / Ctrl+Minus).
     pub icon_size: f32,
     pub columns: Columns,
@@ -305,6 +307,25 @@ impl App {
     /// Opacity of the row hover highlight while it fades in.
     pub fn hover_alpha(&self) -> f32 {
         self.hover_anim.map_or(1.0, |a| a.value(Instant::now()))
+    }
+
+    /// Drag box in grid coordinates (scroll included), normalized to a positive size.
+    pub fn band_rect(&self) -> Option<crate::layout::Rect> {
+        let (x0, y0, _, x1, y1) = self.band.as_ref()?;
+        Some(crate::layout::Rect::new(x0.min(*x1), y0.min(*y1), (x1 - x0).abs(), (y1 - y0).abs()))
+    }
+
+    fn update_band(&mut self, x: f32, y: f32) {
+        let a = self.item_area();
+        let (gx, gy) = (x - a.x, (y - a.y).clamp(0.0, a.h) + self.list.scroll_y);
+        let Some(b) = self.band.as_mut() else { return };
+        (b.3, b.4) = (gx, gy);
+        let mut sel = b.2.clone();
+        if let Some(r) = self.band_rect() {
+            sel.extend(self.grid().cells_in(r, self.list.entries.len()));
+        }
+        self.list.sel.set(sel);
+        self.invalidate();
     }
 
     pub fn grid(&self) -> views::grid::Grid {
@@ -1136,6 +1157,17 @@ impl App {
                 self.list.click_header(c);
                 self.invalidate();
             }
+        } else if self.view == View::Icon && self.item_at(x, y) == Some(None) {
+            // Empty space in icon view starts a drag box.
+            let m = mods();
+            if !m.ctrl {
+                self.list.sel.clear();
+            }
+            let a = self.item_area();
+            let (gx, gy) = (x - a.x, y - a.y + self.list.scroll_y);
+            self.band = Some((gx, gy, self.list.sel.selected(), gx, gy));
+            unsafe { SetCapture(self.hwnd) };
+            self.invalidate();
         } else if let Some(hit) = self.item_at(x, y) {
             match hit {
                 Some(i) => self.list.click_row(i, mods()),
@@ -1375,6 +1407,10 @@ impl App {
             }
             WM_MOUSEMOVE => {
                 let (x, y) = self.client_dip(lp);
+                if self.band.is_some() {
+                    self.update_band(x, y);
+                    return Some(LRESULT(0));
+                }
                 if self.dragging_splitter {
                     self.sidebar_w = x;
                     self.relayout();
@@ -1430,6 +1466,12 @@ impl App {
                 Some(LRESULT(0))
             }
             WM_LBUTTONUP => {
+                if self.band.take().is_some() {
+                    unsafe {
+                        let _ = ReleaseCapture();
+                    }
+                    self.invalidate();
+                }
                 if self.dragging_splitter {
                     self.dragging_splitter = false;
                     unsafe {
@@ -1613,6 +1655,7 @@ pub fn run() -> Result<()> {
             list: ListView::default(),
             view: View::Icon,
             icon_size: views::grid::ICON_DEFAULT,
+            band: None,
             columns: Columns::default(),
             error: None,
             loading: false,
